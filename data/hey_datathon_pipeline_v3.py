@@ -35,6 +35,12 @@ Sección 5B — entrenar_modelo_response_type():
 Sección 6 — generar_perfil_havi():
   • Noise gate en tiempo real (conv_noise_pct + noise_type dominante)
   • Override: bot_explorador → no cross-sell
+
+FIXES v3 (compatibilidad Windows)
+──────────────────────────────────
+  • Eliminado label_binarize (no se usaba)
+  • _resolve / _ensure_output_path / _out unificados para Windows/Linux
+  • n_jobs=1 en cross_val_score (evita MemoryError en Windows con joblib)
 =============================================================
 """
 
@@ -48,7 +54,7 @@ import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
@@ -58,25 +64,44 @@ from sklearn.metrics import (
     confusion_matrix, ConfusionMatrixDisplay,
     brier_score_loss,
 )
-from sklearn.calibration import calibration_curve
+from sklearn.calibration import calibration_curve, CalibratedClassifierCV
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.calibration import CalibratedClassifierCV
 from collections import Counter
 
 
 # ─────────────────────────────────────────────
-# PATHS
+# PATHS — compatibles con Windows, Mac y Linux
 # ─────────────────────────────────────────────
-def _resolve(fn):
-    for p in [f'/mnt/user-data/uploads/{fn}', f'/mnt/data/{fn}', fn]:
-        if os.path.exists(p): return p
-    return f'/mnt/user-data/uploads/{fn}'
 
-def _out(fn):
-    d = '/mnt/user-data/outputs' if os.path.exists('/mnt/user-data') else '/mnt/data/outputs'
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, fn)
+def _resolve(filename):
+    """
+    Busca el archivo en la misma carpeta que el script.
+    Funciona en Windows, Mac y Linux (entorno datathon).
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(script_dir, filename)
+    if os.path.exists(path):
+        return path
+    raise FileNotFoundError(
+        f"\n  ❌ No se encontró '{filename}'"
+        f"\n     Buscado en: {script_dir}"
+        f"\n     Coloca los CSVs en la misma carpeta que el script."
+    )
+
+def _ensure_output_path(filename):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(script_dir, 'outputs')
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, filename)
+
+def _out(filename):
+    """Alias de _ensure_output_path — usado en funciones de plot."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(script_dir, 'outputs')
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, filename)
+
 
 PATH_CLIENTES = _resolve('hey_clientes.csv')
 PATH_PRODUCTOS = _resolve('hey_productos.csv')
@@ -104,7 +129,7 @@ def cargar_datos():
 
 
 # ═══════════════════════════════════════════════════════════
-# SECCIÓN 2 — LIMPIEZA  (sin cambios respecto a v2)
+# SECCIÓN 2 — LIMPIEZA
 # ═══════════════════════════════════════════════════════════
 
 def limpiar_clientes(df):
@@ -169,7 +194,6 @@ def limpiar_conversaciones(df):
 # SECCIÓN 3 — FEATURE ENGINEERING
 # ═══════════════════════════════════════════════════════════
 
-# ── Intent rules (sin cambios) ────────────────────────────
 INTENT_RULES = {
     'credito':       ['crédito','credito','préstamo','prestamo','financiamiento',
                       'dinero prestado','cuánto me prestan'],
@@ -192,7 +216,7 @@ PALABRAS_FINANCIERAS = [
     'nip','token','clabe','depósito','deposito','retiro','compra',
 ]
 
-PALABRAS_URGENCIA   = ['urgente','urge','ya','ahora','inmediato','rápido','rapido','hoy']
+PALABRAS_URGENCIA    = ['urgente','urge','ya','ahora','inmediato','rápido','rapido','hoy']
 PALABRAS_FRUSTRACION = ['error','no me deja','no funciona','problema','falla','bloqueado',
                         'no puedo','imposible','molesto','molesta','queja','mal servicio']
 
@@ -212,13 +236,11 @@ def _frustracion(texto):
     return int(any(p in str(texto).lower() for p in PALABRAS_FRUSTRACION))
 
 
-# ══ NUEVO EN v3 ══════════════════════════════════════════════
-# 3c — Detector de ruido extendido con tipificación por categoría
-# ─────────────────────────────────────────────────────────────
+# ── 3c — Detector de ruido ───────────────────────────────
 #
-# DECISIÓN DE DISEÑO: los mensajes de ruido NO se eliminan del pipeline.
-# Se convierten en señal para que el GBM aprenda cuándo Havi debe
-# adaptar su respuesta (educativo/neutro en vez de cross-sell).
+# DECISIÓN DE DISEÑO: los mensajes de ruido NO se eliminan.
+# Se convierten en señal para que el GBM aprenda cuándo Havi
+# debe responder en modo educativo en vez de cross-sell.
 #
 # Tipos de ruido identificados en el corpus real:
 #
@@ -237,20 +259,20 @@ _AFIRM_NEG = frozenset([
     'entendido','claro','de acuerdo','por favor','adelante',
     'continuar','siguiente','no gracias','np',
 ])
-_MENU_NAV  = frozenset(['a','b','c','d','1','2','3','4','a)','b)','c)','d)','1.','2.','3.'])
-_BROMAS    = ['chiste','cuéntame un chiste','cuentame un chiste','te amo','te quiero',
-              'quien eres','quién eres','eres humano','eres ia','eres real',
-              'gaming','cántame','cantame','me ayudas a ligar']
+_MENU_NAV = frozenset(['a','b','c','d','1','2','3','4','a)','b)','c)','d)','1.','2.','3.'])
+_BROMAS   = ['chiste','cuéntame un chiste','cuentame un chiste','te amo','te quiero',
+             'quien eres','quién eres','eres humano','eres ia','eres real',
+             'gaming','cántame','cantame','me ayudas a ligar']
 
 # Pesos para el noise_score compuesto (0–1, soft signal)
 _W = {
-    'artefacto_voz':     0.20,   # ruido técnico, se procesa igual
-    'menu_navegacion':   0.55,   # navegación, no intención original
-    'afirmacion_negacion': 0.40, # respuesta simple mid-conversación
-    'exploracion_corta': 0.65,   # sin intención financiera clara
-    'broma_offtopic':    0.85,   # claramente off-topic
-    'solo_simbolos':     0.90,   # sin contenido semántico
-    'on_topic':          0.0,    # sin ruido
+    'artefacto_voz':       0.20,
+    'menu_navegacion':     0.55,
+    'afirmacion_negacion': 0.40,
+    'exploracion_corta':   0.65,
+    'broma_offtopic':      0.85,
+    'solo_simbolos':       0.90,
+    'on_topic':            0.00,
 }
 
 
@@ -259,13 +281,12 @@ def calcular_noise_features(texto):
     Calcula señales de ruido/relevancia a nivel de turno individual.
 
     Retorna un pd.Series con:
-      noise_type          — categoría dominante del ruido
-      noise_score_msg     — puntuación suave de ruido [0, 1]
-                            (0 = totalmente on_topic, 1 = puro ruido)
-      is_financial_msg    — contiene términos del dominio financiero/Hey
-      is_voz_artefacto    — patrón de transcripción STT (dobles espacios)
-      joke_score_msg      — señal de broma/off-topic
-      low_intent_score_msg— señal de baja intención financiera
+      noise_type           — categoría dominante del ruido
+      noise_score_msg      — puntuación suave [0, 1]
+      is_financial_msg     — contiene términos del dominio financiero/Hey
+      is_voz_artefacto     — patrón de transcripción STT (dobles espacios)
+      joke_score_msg       — señal de broma/off-topic
+      low_intent_score_msg — señal de baja intención financiera
     """
     if pd.isna(texto):
         return pd.Series({
@@ -279,50 +300,47 @@ def calcular_noise_features(texto):
     tokens = re.findall(r'\w+', t_low, flags=re.UNICODE)
     n_tok  = len(tokens)
 
-    # ── 1. Artefacto de voz (transcripción STT con doble espacio) ──
-    #   Patrón real detectado: " palabra  palabra  palabra "
-    is_voz_art = int(bool(re.search(r'\w{3,}\s{2,}\w{3,}\s{2,}\w{3,}', t_raw)))
+    # 1. Artefacto de voz — patrón STT: doble espacio entre palabras
+    is_voz_art  = int(bool(re.search(r'\w{3,}\s{2,}\w{3,}\s{2,}\w{3,}', t_raw)))
 
-    # ── 2. Solo símbolos / emojis ──────────────────────────────────
+    # 2. Solo símbolos / emojis
     is_only_sym = int(len(t_low) > 0 and not bool(re.search(r'[a-záéíóúñ0-9]', t_low, re.I)))
 
-    # ── 3. Broma / off-topic ───────────────────────────────────────
-    is_broma = int(any(b in t_low for b in _BROMAS))
+    # 3. Broma / off-topic
+    is_broma    = int(any(b in t_low for b in _BROMAS))
 
-    # ── 4. Navegación de menú ──────────────────────────────────────
-    is_menu = int(t_low in _MENU_NAV)
+    # 4. Navegación de menú
+    is_menu     = int(t_low in _MENU_NAV)
 
-    # ── 5. Afirmación / negación pura ─────────────────────────────
-    is_afirm = int(t_low in _AFIRM_NEG)
+    # 5. Afirmación / negación pura
+    is_afirm    = int(t_low in _AFIRM_NEG)
 
-    # ── 6. Exploración corta (sin contenido financiero) ────────────
-    # FIX v3: word boundary para evitar falsos positivos ("cuentas" ≠ "cuenta")
-    has_fin    = int(any(re.search(r'\b' + re.escape(fw) + r'\b', t_low)
-                         for fw in PALABRAS_FINANCIERAS))
-    is_explor  = int(n_tok <= 2 and not has_fin and not is_afirm and not is_menu)
+    # 6. Exploración corta — word boundary para evitar falsos positivos
+    has_fin     = int(any(re.search(r'\b' + re.escape(fw) + r'\b', t_low)
+                          for fw in PALABRAS_FINANCIERAS))
+    is_explor   = int(n_tok <= 2 and not has_fin and not is_afirm and not is_menu)
 
-    # ── Clasificación por prioridad ────────────────────────────────
-    if   is_only_sym:  noise_type = 'solo_simbolos'
-    elif is_broma:     noise_type = 'broma_offtopic'
-    elif is_voz_art:   noise_type = 'artefacto_voz'
-    elif is_menu:      noise_type = 'menu_navegacion'
-    elif is_afirm:     noise_type = 'afirmacion_negacion'
-    elif is_explor:    noise_type = 'exploracion_corta'
-    else:              noise_type = 'on_topic'
+    # Clasificación por prioridad
+    if   is_only_sym: noise_type = 'solo_simbolos'
+    elif is_broma:    noise_type = 'broma_offtopic'
+    elif is_voz_art:  noise_type = 'artefacto_voz'
+    elif is_menu:     noise_type = 'menu_navegacion'
+    elif is_afirm:    noise_type = 'afirmacion_negacion'
+    elif is_explor:   noise_type = 'exploracion_corta'
+    else:             noise_type = 'on_topic'
 
-    # ── Score compuesto ────────────────────────────────────────────
+    # Score compuesto — atenuar si hay términos financieros
     raw_score = _W[noise_type]
-    # Atenuar si contiene términos financieros (ruido con contexto)
     if has_fin and raw_score > 0:
         raw_score *= 0.45
     noise_score = round(min(1.0, raw_score), 4)
 
     return pd.Series({
-        'noise_type':          noise_type,
-        'noise_score_msg':     noise_score,
-        'is_financial_msg':    has_fin,
-        'is_voz_artefacto':    is_voz_art,
-        'joke_score_msg':      is_broma,
+        'noise_type':           noise_type,
+        'noise_score_msg':      noise_score,
+        'is_financial_msg':     has_fin,
+        'is_voz_artefacto':     is_voz_art,
+        'joke_score_msg':       is_broma,
         'low_intent_score_msg': int(noise_type in ('exploracion_corta','afirmacion_negacion',
                                                     'menu_navegacion','broma_offtopic')),
     })
@@ -330,55 +348,47 @@ def calcular_noise_features(texto):
 
 def _agregar_noise_features_usuario(convs):
     """
-    ══ NUEVO EN v3 ══
-    Computa features de ruido agregadas a nivel de usuario.
-    Se llama desde features_conversaciones().
+    Features de ruido agregadas a nivel de usuario.
 
-    Features nuevas:
-      conv_noise_pct        % de turnos con noise_score > 0.35
-      conv_noise_max        max noise_score del usuario
-      conv_afirm_neg_pct    % turnos afirmacion/negacion
-      conv_menu_nav_pct     % turnos navegacion de menú
-      conv_broma_pct        % turnos broma/offtopic
-      conv_voz_artefacto_pct% turnos con artefacto STT
-      conv_exploratorio_score puntuación de comportamiento explorador
-                              = conv_noise_pct ponderado por conv_noise_max
-      conv_noise_trend      diferencia en noise_score entre primera y
-                              segunda mitad de conversaciones del usuario
-                              (positivo = cada vez más ruidoso, negativo = se enfoca)
+    Features:
+      conv_noise_pct         % turnos con noise_score > 0.35
+      conv_noise_max         max noise_score del usuario
+      conv_afirm_neg_pct     % turnos afirmacion/negacion
+      conv_menu_nav_pct      % turnos navegacion de menú
+      conv_broma_pct         % turnos broma/offtopic
+      conv_voz_artefacto_pct % turnos con artefacto STT
+      conv_exploratorio_score conv_noise_pct × conv_noise_max
+      conv_noise_trend        diferencia noise_score 1a vs 2a mitad
     """
-    # Umbral para considerar un turno como "ruidoso"
     NOISE_THRESHOLD = 0.35
 
     agg = convs.groupby('user_id').agg(
         conv_noise_pct         = ('noise_score_msg',
-                                  lambda x: (x > NOISE_THRESHOLD).mean()),
+                                   lambda x: (x > NOISE_THRESHOLD).mean()),
         conv_noise_max         = ('noise_score_msg', 'max'),
         conv_afirm_neg_pct     = ('noise_type',
-                                  lambda x: (x == 'afirmacion_negacion').mean()),
+                                   lambda x: (x == 'afirmacion_negacion').mean()),
         conv_menu_nav_pct      = ('noise_type',
-                                  lambda x: (x == 'menu_navegacion').mean()),
+                                   lambda x: (x == 'menu_navegacion').mean()),
         conv_broma_pct         = ('noise_type',
-                                  lambda x: (x == 'broma_offtopic').mean()),
+                                   lambda x: (x == 'broma_offtopic').mean()),
         conv_voz_artefacto_pct = ('is_voz_artefacto', 'mean'),
     ).reset_index()
 
-    # conv_exploratorio_score: combina qué tan seguido y qué tan extremo es el ruido
     agg['conv_exploratorio_score'] = (
         agg['conv_noise_pct'] * agg['conv_noise_max']
     ).round(4)
 
-    # conv_noise_trend: ¿el usuario se vuelve más o menos ruidoso con el tiempo?
-    # Dividimos las conversaciones de cada usuario en primera y segunda mitad
+    # Trend: ¿el usuario se vuelve más o menos ruidoso con el tiempo?
     convs_sorted = convs.sort_values(['user_id', 'date'])
+
     def _trend(grp):
         n = len(grp)
-        if n < 4:
-            return 0.0
-        mid = n // 2
+        if n < 4: return 0.0
+        mid     = n // 2
         primera = grp.iloc[:mid]['noise_score_msg'].mean()
-        segunda  = grp.iloc[mid:]['noise_score_msg'].mean()
-        return round(segunda - primera, 4)   # positivo → más ruidoso al final
+        segunda = grp.iloc[mid:]['noise_score_msg'].mean()
+        return round(segunda - primera, 4)
 
     trend = convs_sorted.groupby('user_id').apply(_trend).reset_index()
     trend.columns = ['user_id', 'conv_noise_trend']
@@ -388,14 +398,9 @@ def _agregar_noise_features_usuario(convs):
 
 
 def features_conversaciones(convs):
-    """
-    Agrega features conversacionales por usuario.
-    v3: añade 7 nuevas features de ruido + conv_noise_trend.
-    """
     print("  [features] conversaciones...")
     convs = convs.copy()
 
-    # ── Señales turn-level ─────────────────────────────────
     convs['intent']      = convs['input'].apply(_intent)
     convs['urgencia']    = convs['input'].apply(_urgencia)
     convs['frustracion'] = convs['input'].apply(_frustracion)
@@ -403,11 +408,9 @@ def features_conversaciones(convs):
     noise_cols = convs['input'].apply(calcular_noise_features)
     convs = pd.concat([convs, noise_cols], axis=1)
 
-    # Turnos por conversación
-    tc = convs.groupby('conv_id')['input'].count().reset_index(name='turnos_conv')
+    tc    = convs.groupby('conv_id')['input'].count().reset_index(name='turnos_conv')
     convs = convs.merge(tc, on='conv_id', how='left')
 
-    # ── Agregación base ───────────────────────────────────
     agg = convs.groupby('user_id').agg(
         conv_n_total        = ('conv_id', 'nunique'),
         conv_turnos_total   = ('input', 'count'),
@@ -419,12 +422,10 @@ def features_conversaciones(convs):
         conv_input_len_max  = ('input_len', 'max'),
         conv_urgencia       = ('urgencia', 'sum'),
         conv_frustracion    = ('frustracion', 'sum'),
-        # noise base (v2)
         conv_noise_score    = ('noise_score_msg', 'mean'),
         conv_joke_score     = ('joke_score_msg', 'mean'),
         conv_low_intent     = ('low_intent_score_msg', 'mean'),
         conv_relevancia_fin = ('is_financial_msg', 'mean'),
-        # intents
         intent_credito      = ('intent', lambda x: (x == 'credito').sum()),
         intent_transferencia= ('intent', lambda x: (x == 'transferencia').sum()),
         intent_tarjeta      = ('intent', lambda x: (x == 'tarjeta').sum()),
@@ -435,7 +436,7 @@ def features_conversaciones(convs):
         intent_negocio      = ('intent', lambda x: (x == 'negocio').sum()),
     ).reset_index()
 
-    # ── Reintentos < 48h ──────────────────────────────────
+    # Reintentos < 48h
     convs_s = convs.sort_values(['user_id', 'date'])
     convs_s['prev_date'] = convs_s.groupby('user_id')['date'].shift(1)
     convs_s['hrs_gap']   = (convs_s['date'] - convs_s['prev_date']).dt.total_seconds() / 3600
@@ -443,7 +444,7 @@ def features_conversaciones(convs):
     agg = agg.merge(reintentos.rename('conv_reintentos_48h'), on='user_id', how='left')
     agg['conv_reintentos_48h'] = agg['conv_reintentos_48h'].fillna(0)
 
-    # ══ NUEVO EN v3 ══ features de ruido por usuario
+    # Noise features por usuario
     noise_user = _agregar_noise_features_usuario(convs)
     agg = agg.merge(noise_user, on='user_id', how='left')
 
@@ -452,7 +453,6 @@ def features_conversaciones(convs):
 
 
 def features_transacciones(txn):
-    """Sin cambios respecto a v2."""
     print("  [features] transacciones...")
     agg = txn.groupby('user_id').agg(
         txn_total          = ('transaccion_id', 'count'),
@@ -483,14 +483,13 @@ def features_transacciones(txn):
         txn_pct_finde      = ('dia_semana', lambda x: x.isin(['Saturday','Sunday']).mean()),
         txn_pct_nocturno   = ('hora_del_dia', lambda x: ((x >= 22) | (x <= 5)).mean()),
     ).reset_index()
-    agg['txn_volatilidad']   = agg['txn_monto_std'] / (agg['txn_monto_prom'] + 1)
-    agg['txn_frec_por_dia']  = agg['txn_total'] / (agg['txn_n_dias_activo'] + 1)
+    agg['txn_volatilidad']  = agg['txn_monto_std'] / (agg['txn_monto_prom'] + 1)
+    agg['txn_frec_por_dia'] = agg['txn_total'] / (agg['txn_n_dias_activo'] + 1)
     print(f"    → {agg.shape[1]-1} features para {len(agg):,} usuarios")
     return agg
 
 
 def features_productos(prods):
-    """Sin cambios respecto a v2."""
     print("  [features] productos...")
     agg = prods.groupby('user_id').agg(
         prod_n_total          = ('producto_id', 'count'),
@@ -507,9 +506,11 @@ def features_productos(prods):
         prod_saldo_total      = ('saldo_actual', 'sum'),
         prod_limite_total     = ('limite_credito', 'sum'),
     ).reset_index()
-    agg['prod_util_media']      = agg['prod_util_media'].fillna(0)
-    agg['prod_util_max']        = agg['prod_util_max'].fillna(0)
-    agg['prod_ratio_problematicos'] = (agg['prod_n_cancelados'] + agg['prod_n_revision']) / (agg['prod_n_total'] + 1)
+    agg['prod_util_media']          = agg['prod_util_media'].fillna(0)
+    agg['prod_util_max']            = agg['prod_util_max'].fillna(0)
+    agg['prod_ratio_problematicos'] = (
+        agg['prod_n_cancelados'] + agg['prod_n_revision']
+    ) / (agg['prod_n_total'] + 1)
     print(f"    → {agg.shape[1]-1} features para {len(agg):,} usuarios")
     return agg
 
@@ -529,7 +530,7 @@ def construir_master(clientes, productos, txn, convs):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECCIÓN 4 — SEGMENTACIÓN  (sin cambios respecto a v2)
+# SECCIÓN 4 — SEGMENTACIÓN
 # ═══════════════════════════════════════════════════════════
 
 FEATURES_CLUSTERING = [
@@ -542,7 +543,6 @@ FEATURES_CLUSTERING = [
     'prod_ratio_problematicos',
     'conv_n_total','conv_pct_voz','conv_input_len_med',
     'conv_urgencia','conv_frustracion',
-    # ══ NUEVO EN v3: noise features en clustering ══
     'conv_noise_score','conv_noise_pct','conv_exploratorio_score',
     'conv_afirm_neg_pct','conv_noise_trend',
     'intent_credito','intent_inversion','intent_negocio','intent_aclaracion',
@@ -553,10 +553,10 @@ def segmentar_usuarios(master, n_clusters=5, random_state=42):
     print("\n" + "═"*60)
     print("  SEGMENTACIÓN NO SUPERVISADA")
     print("═"*60)
-    cols = [c for c in FEATURES_CLUSTERING if c in master.columns]
-    X = master[cols].copy()
+    cols  = [c for c in FEATURES_CLUSTERING if c in master.columns]
+    X     = master[cols].copy()
     scaler = StandardScaler()
-    X_sc   = scaler.fit_transform(X)
+    X_sc  = scaler.fit_transform(X)
 
     print("\n  Evaluando k óptimo...")
     inercias, silhouettes = [], []
@@ -577,7 +577,8 @@ def segmentar_usuarios(master, n_clusters=5, random_state=42):
 
     pca = PCA(n_components=2, random_state=random_state)
     Xp  = pca.fit_transform(X_sc)
-    master['pca_x'] = Xp[:, 0]; master['pca_y'] = Xp[:, 1]
+    master['pca_x'] = Xp[:, 0]
+    master['pca_y'] = Xp[:, 1]
     print(f"  Varianza explicada PCA 2D: {pca.explained_variance_ratio_.sum():.2%}")
     return master, scaler, km5, cols, inercias, silhouettes
 
@@ -587,59 +588,57 @@ def nombrar_segmentos(master):
                             'txn_pct_efectivo','txn_n_viajes','prod_tiene_negocio',
                             'conv_pct_voz','conv_noise_pct'] if c in master.columns]
     perfil = master.groupby('segmento_id')[cols_ok].mean()
-    print("\n  Perfil de segmentos:"); print(perfil.round(2).to_string())
-    NOMBRES = {0:'PYME Emprendedor', 1:'Digital Básico',
-               2:'Premium Digital',  3:'Familia Establecida',
-               4:'Ahorrador Cauteloso'}
+    print("\n  Perfil de segmentos:")
+    print(perfil.round(2).to_string())
+    NOMBRES = {
+        0: 'PYME Emprendedor',
+        1: 'Digital Básico',
+        2: 'Premium Digital',
+        3: 'Familia Establecida',
+        4: 'Ahorrador Cauteloso',
+    }
     master['segmento_nombre'] = master['segmento_id'].map(NOMBRES)
     return master
 
 
 # ═══════════════════════════════════════════════════════════
-# SECCIÓN 5 — MODELOS PREDICTIVOS (expandido en v3)
+# SECCIÓN 5 — MODELOS PREDICTIVOS
 # ═══════════════════════════════════════════════════════════
 
 def construir_targets(master):
     """
-    Construye targets binarios para los clasificadores auxiliares.
+    Targets binarios para los clasificadores auxiliares.
 
-    ══ NUEVO EN v3 ══
-    target_interaccion_ruido: usuarios cuyas sesiones son
-      mayoritariamente de ruido (conv_noise_pct > 0.40).
-      Havi los trata en modo educativo/exploración, sin cross-sell.
+    target_interaccion_ruido (NUEVO v3):
+      Usuarios cuyas sesiones son mayoritariamente ruido (>40%).
+      Havi los trata en modo educativo, sin cross-sell.
     """
     df = master.copy()
 
-    # Tono formal
     df['target_tono_formal'] = (
         df['ocupacion'].isin(['Empresario', 'Jubilado']) |
         (df['ingreso_mensual_mxn'] > 37_000) |
         (df['nivel_educativo'] == 'Posgrado')
     ).astype(int)
 
-    # Prefiere voz
     df['target_prefiere_voz'] = (df['conv_pct_voz'] > 0.10).astype(int)
 
-    # Alta propensión a crédito
     df['target_propension_credito'] = (
         (df['intent_credito'] > 0) &
         (~df['prod_tiene_credito'].astype(bool))
     ).astype(int)
 
-    # Riesgo de churn
     df['target_riesgo_churn'] = (
         (df['dias_desde_ultimo_login'] > 30) &
         (df['satisfaccion_1_10'] < 6)
     ).astype(int)
 
-    # Alto engagement
     df['target_engagement_alto'] = (
         (df['conv_n_total'] > 2) &
         (df['txn_frec_por_dia'] > 1)
     ).astype(int)
 
-    # ══ NUEVO EN v3 ══ — Usuario explorador/ruido
-    # Umbral 0.40: más del 40% de sus mensajes son de ruido
+    # NUEVO v3 — umbral 0.40: >40% de sus mensajes son ruido
     df['target_interaccion_ruido'] = (df['conv_noise_pct'] > 0.40).astype(int)
 
     print("\n  Distribución de targets:")
@@ -651,32 +650,25 @@ def construir_targets(master):
     return df
 
 
-# ── Feature sets ─────────────────────────────────────────
 FEATURES_MODELO = [
-    # Demográficas
     'edad','ingreso_mensual_mxn','score_buro','antiguedad_dias',
     'num_productos_activos','satisfaccion_1_10',
-    # Transaccional
     'txn_monto_prom','txn_pct_digital','txn_pct_efectivo',
     'txn_n_viajes','txn_volatilidad','txn_frec_por_dia',
     'txn_pct_atipico','txn_pct_fallida','txn_n_intentos_ext',
-    # Portafolio
     'prod_n_activos','prod_util_media','prod_util_max',
     'prod_tiene_credito','prod_tiene_inversion','prod_tiene_negocio',
     'prod_ratio_problematicos',
-    # Conversacional base
     'conv_n_total','conv_pct_voz','conv_input_len_med',
     'conv_urgencia','conv_frustracion','conv_reintentos_48h',
-    # ══ NUEVO v3: noise features ══
+    # Noise features (NUEVO v3)
     'conv_noise_score','conv_noise_pct','conv_noise_max',
     'conv_exploratorio_score','conv_noise_trend',
     'conv_afirm_neg_pct','conv_menu_nav_pct',
     'conv_broma_pct','conv_voz_artefacto_pct',
     'conv_joke_score','conv_low_intent','conv_relevancia_fin',
-    # Intents
     'intent_credito','intent_inversion','intent_negocio',
     'intent_aclaracion','intent_tarjeta','intent_seguridad',
-    # Segmento
     'segmento_id',
 ]
 
@@ -686,28 +678,41 @@ TARGETS_BINARIOS = [
     'target_propension_credito',
     'target_riesgo_churn',
     'target_engagement_alto',
-    'target_interaccion_ruido',   # ══ NUEVO v3 ══
+    'target_interaccion_ruido',   # NUEVO v3
 ]
 
 
-# ══ NUEVO EN v3 ══════════════════════════════════════════════
-# GBM completo con CV, calibración y threshold óptimo
-# ─────────────────────────────────────────────────────────────
+def _preparar_X(X):
+    """
+    Limpia un DataFrame de features antes de pasarlo a sklearn:
+      1. Elimina columnas duplicadas (causa del AttributeError en Windows)
+      2. Convierte booleanos y object-bool a int
+    """
+    X = X.loc[:, ~X.columns.duplicated()].copy()
+    for c in X.columns:
+        if X[c].dtype == bool:
+            X[c] = X[c].astype(int)
+        elif X[c].dtype == object:
+            try:
+                X[c] = X[c].astype(int)
+            except (ValueError, TypeError):
+                X = X.drop(columns=[c])
+    return X
+
 
 def _gbm_base(n_estimators=120, max_depth=4, lr=0.05):
     return GradientBoostingClassifier(
         n_estimators=n_estimators, max_depth=max_depth,
-        learning_rate=lr, subsample=0.8,
-        random_state=42,
+        learning_rate=lr, subsample=0.8, random_state=42,
     )
 
 
 def _threshold_optimo_f1(y_true, y_prob):
-    """Encuentra el umbral de clasificación que maximiza F1."""
+    """Encuentra el umbral que maximiza F1."""
     best_t, best_f1 = 0.5, 0.0
     for t in np.linspace(0.1, 0.9, 81):
         y_hat = (y_prob >= t).astype(int)
-        f1 = f1_score(y_true, y_hat, zero_division=0)
+        f1    = f1_score(y_true, y_hat, zero_division=0)
         if f1 > best_f1:
             best_f1, best_t = f1, t
     return round(best_t, 2), round(best_f1, 4)
@@ -715,34 +720,29 @@ def _threshold_optimo_f1(y_true, y_prob):
 
 def entrenar_modelos(master, plot=True):
     """
-    ══ NUEVO EN v3 ══
-    Entrena un GBM calibrado por cada target binario.
+    GBM calibrado por cada target binario.
 
-    Mejoras sobre v2:
-      • StratifiedKFold (k=5): AUC media ± std
-      • CalibratedClassifierCV (isotonic): probabilidades bien calibradas
-      • Threshold óptimo por F1
-      • Curvas ROC + calibración + feature importance (si plot=True)
+    • StratifiedKFold (k=5): AUC media ± std
+    • CalibratedClassifierCV (isotonic): probabilidades calibradas
+    • Threshold óptimo por F1
+    • n_jobs=1 — evita MemoryError de joblib en Windows
     """
     print("\n" + "═"*60)
     print("  MODELOS BINARIOS (v3 — CV + calibración)")
     print("═"*60)
 
-    cols    = [c for c in FEATURES_MODELO if c in master.columns]
-    kfold   = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    modelos = {}
-
-    # Almacenar curvas para plot
+    cols     = [c for c in FEATURES_MODELO if c in master.columns]
+    kfold    = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    modelos  = {}
     roc_data = {}
 
     for target in TARGETS_BINARIOS:
         if target not in master.columns:
             continue
+
         X = master[cols].copy()
-        # Convertir booleanos
-        for c in X.columns:
-            if X[c].dtype == bool:
-                X[c] = X[c].astype(int)
+        X = _preparar_X(X)
+        cols = X.columns.tolist()   # sincronizar tras deduplicar/limpiar
         y = master[target]
 
         pos_rate = y.mean()
@@ -750,18 +750,17 @@ def entrenar_modelos(master, plot=True):
             print(f"\n  [{target}] OMITIDO — desequilibrio extremo ({pos_rate:.2%})")
             continue
 
-        # ── CV en el estimador base (no calibrado) ──────────
+        # CV en estimador base — n_jobs=1 para evitar MemoryError en Windows
         base_model = _gbm_base()
-        cv_aucs = cross_val_score(base_model, X, y, cv=kfold,
-                                  scoring='roc_auc', n_jobs=-1)
+        cv_aucs = cross_val_score(
+            base_model, X, y, cv=kfold, scoring='roc_auc', n_jobs=1
+        )
 
-        # ── Modelo calibrado sobre split 80/20 ──────────────
+        # Modelo calibrado sobre split 80/20
         X_tr, X_te, y_tr, y_te = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
-        cal_model = CalibratedClassifierCV(
-            _gbm_base(), method='isotonic', cv=5
-        )
+        cal_model = CalibratedClassifierCV(_gbm_base(), method='isotonic', cv=5)
         cal_model.fit(X_tr, y_tr)
         y_prob_te = cal_model.predict_proba(X_te)[:, 1]
 
@@ -771,11 +770,9 @@ def entrenar_modelos(master, plot=True):
         y_pred_t  = (y_prob_te >= thr).astype(int)
         f1_macro  = f1_score(y_te, y_pred_t, average='macro', zero_division=0)
 
-        # Feature importance del estimador base interno
-        # CalibratedClassifierCV guarda los estimadores en .calibrated_classifiers_
-        fi_list = []
-        for cc in cal_model.calibrated_classifiers_:
-            fi_list.append(cc.estimator.feature_importances_)
+        # Feature importance media de los calibradores internos
+        fi_list = [cc.estimator.feature_importances_
+                   for cc in cal_model.calibrated_classifiers_]
         fi_mean = np.mean(fi_list, axis=0)
         top5    = pd.Series(fi_mean, index=cols).nlargest(5)
 
@@ -797,7 +794,6 @@ def entrenar_modelos(master, plot=True):
         fpr, tpr, _ = roc_curve(y_te, y_prob_te)
         roc_data[target] = (fpr, tpr, auc_te, thr)
 
-    # ── Plots ────────────────────────────────────────────────
     if plot and roc_data:
         _plot_roc_curves(roc_data)
         _plot_feature_importances(modelos)
@@ -807,72 +803,77 @@ def entrenar_modelos(master, plot=True):
 
 
 def _plot_roc_curves(roc_data):
-    """Curvas ROC para todos los modelos binarios."""
     fig, ax = plt.subplots(figsize=(8, 6), facecolor='white')
     COLORS = ['#378ADD','#1D9E75','#7F77DD','#BA7517','#D85A30','#E24B4A']
     etiquetas = {
-        'target_tono_formal':         'Tono formal',
-        'target_prefiere_voz':        'Prefiere voz',
-        'target_propension_credito':  'Propensión crédito',
-        'target_riesgo_churn':        'Riesgo churn',
-        'target_engagement_alto':     'Engagement alto',
-        'target_interaccion_ruido':   'Interacción ruido ★',
+        'target_tono_formal':        'Tono formal',
+        'target_prefiere_voz':       'Prefiere voz',
+        'target_propension_credito': 'Propensión crédito',
+        'target_riesgo_churn':       'Riesgo churn',
+        'target_engagement_alto':    'Engagement alto',
+        'target_interaccion_ruido':  'Interacción ruido ★',
     }
     for i, (target, (fpr, tpr, auc_v, thr)) in enumerate(roc_data.items()):
         lbl = etiquetas.get(target, target)
         ax.plot(fpr, tpr, color=COLORS[i % len(COLORS)], lw=1.5,
                 label=f'{lbl} (AUC={auc_v:.3f})')
     ax.plot([0,1],[0,1],'--', color='#888', lw=0.8, label='Aleatorio')
-    ax.set_xlabel('Tasa de falsos positivos'); ax.set_ylabel('Tasa de verdaderos positivos')
+    ax.set_xlabel('Tasa de falsos positivos')
+    ax.set_ylabel('Tasa de verdaderos positivos')
     ax.set_title('Curvas ROC — modelos binarios Havi v3', fontsize=12, fontweight='bold')
     ax.legend(fontsize=8, loc='lower right')
-    ax.set_facecolor('#f8f8f8'); ax.grid(True, alpha=0.3, linewidth=0.5)
+    ax.set_facecolor('#f8f8f8')
+    ax.grid(True, alpha=0.3, linewidth=0.5)
     plt.tight_layout()
-    p = _out('plot_roc_binarios.png')
-    plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
-    print(f"\n  → Curvas ROC: {p}")
+    plt.savefig(_out('plot_roc_binarios.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n  → Curvas ROC guardadas")
 
 
 def _plot_feature_importances(modelos):
-    """Feature importance top-8 por modelo, en grilla."""
     n = len(modelos)
     if n == 0: return
-    cols_g = min(3, n); rows_g = (n + cols_g - 1) // cols_g
-    fig, axes = plt.subplots(rows_g, cols_g, figsize=(5*cols_g, 3.5*rows_g), facecolor='white')
+    cols_g = min(3, n)
+    rows_g = (n + cols_g - 1) // cols_g
+    fig, axes = plt.subplots(rows_g, cols_g,
+                             figsize=(5*cols_g, 3.5*rows_g), facecolor='white')
     axes = np.array(axes).flatten() if n > 1 else [axes]
     etiquetas = {
-        'target_tono_formal':         'Tono formal',
-        'target_prefiere_voz':        'Prefiere voz',
-        'target_propension_credito':  'Propensión crédito',
-        'target_riesgo_churn':        'Riesgo churn',
-        'target_engagement_alto':     'Engagement alto',
-        'target_interaccion_ruido':   'Interacción ruido ★',
+        'target_tono_formal':        'Tono formal',
+        'target_prefiere_voz':       'Prefiere voz',
+        'target_propension_credito': 'Propensión crédito',
+        'target_riesgo_churn':       'Riesgo churn',
+        'target_engagement_alto':    'Engagement alto',
+        'target_interaccion_ruido':  'Interacción ruido ★',
     }
     COLORS = ['#378ADD','#1D9E75','#7F77DD','#BA7517','#D85A30','#E24B4A']
     for i, (target, info) in enumerate(modelos.items()):
-        ax = axes[i]; top = info['top_features']
+        ax    = axes[i]
+        top   = info['top_features']
         color = COLORS[i % len(COLORS)]
         ax.barh(top.index[::-1], top.values[::-1], color=color, alpha=0.85, height=0.6)
         ax.set_title(etiquetas.get(target, target), fontsize=9, fontweight='bold')
-        ax.set_xlabel('Importancia', fontsize=8); ax.tick_params(axis='y', labelsize=7)
-        ax.set_facecolor('#f8f8f8'); ax.grid(True, alpha=0.3, axis='x', linewidth=0.5)
-    for j in range(i+1, len(axes)): axes[j].set_visible(False)
-    plt.suptitle('Feature Importance por modelo (top features)', fontsize=11, fontweight='bold')
+        ax.set_xlabel('Importancia', fontsize=8)
+        ax.tick_params(axis='y', labelsize=7)
+        ax.set_facecolor('#f8f8f8')
+        ax.grid(True, alpha=0.3, axis='x', linewidth=0.5)
+    for j in range(i+1, len(axes)):
+        axes[j].set_visible(False)
+    plt.suptitle('Feature Importance por modelo', fontsize=11, fontweight='bold')
     plt.tight_layout()
-    p = _out('plot_feature_importance.png')
-    plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
-    print(f"  → Feature importance: {p}")
+    plt.savefig(_out('plot_feature_importance.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  → Feature importance guardada")
 
 
 def _plot_calibracion(master, modelos):
     """
-    ══ NUEVO EN v3 ══
-    Curva de calibración: compara probabilidad predicha vs frecuencia real.
-    Un modelo bien calibrado sigue la diagonal.
-    Especialmente importante para target_interaccion_ruido (el noise gate).
+    Curva de calibración — especialmente importante para
+    target_interaccion_ruido porque el noise gate usa probabilidades.
     """
-    targets_plot = ['target_interaccion_ruido','target_propension_credito','target_riesgo_churn']
-    targets_plot = [t for t in targets_plot if t in modelos]
+    targets_plot = [t for t in ['target_interaccion_ruido',
+                                'target_propension_credito',
+                                'target_riesgo_churn'] if t in modelos]
     if not targets_plot: return
 
     fig, ax = plt.subplots(figsize=(7, 5), facecolor='white')
@@ -882,15 +883,13 @@ def _plot_calibracion(master, modelos):
         'target_propension_credito': 'Propensión crédito',
         'target_riesgo_churn':       'Riesgo churn',
     }
-
     for i, target in enumerate(targets_plot):
-        info   = modelos[target]
-        cols   = info['cols']
-        model  = info['model']
+        info  = modelos[target]
+        model = info['model']
+        cols  = info['cols']
         X = master[[c for c in cols if c in master.columns]].copy()
-        for c in X.columns:
-            if X[c].dtype == bool: X[c] = X[c].astype(int)
-        y = master[target]
+        X = _preparar_X(X)
+        y     = master[target]
         probs = model.predict_proba(X)[:, 1]
         frac_pos, mean_pred = calibration_curve(y, probs, n_bins=8, strategy='quantile')
         ax.plot(mean_pred, frac_pos, 'o-', color=COLORS[i], lw=1.5,
@@ -899,19 +898,21 @@ def _plot_calibracion(master, modelos):
     ax.plot([0,1],[0,1],'--', color='#888', lw=0.8, label='Calibración perfecta')
     ax.set_xlabel('Probabilidad predicha media')
     ax.set_ylabel('Fracción de positivos reales')
-    ax.set_title('Curva de calibración — modelos clave\n(★ noise gate debe estar bien calibrado)',
-                 fontsize=11, fontweight='bold')
-    ax.legend(fontsize=9); ax.set_facecolor('#f8f8f8')
+    ax.set_title(
+        'Curva de calibración — modelos clave\n'
+        '(★ noise gate debe estar bien calibrado)',
+        fontsize=11, fontweight='bold'
+    )
+    ax.legend(fontsize=9)
+    ax.set_facecolor('#f8f8f8')
     ax.grid(True, alpha=0.3, linewidth=0.5)
     plt.tight_layout()
-    p = _out('plot_calibracion.png')
-    plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
-    print(f"  → Calibración: {p}")
+    plt.savefig(_out('plot_calibracion.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  → Calibración guardada")
 
 
-# ── Target multicategoría + noise gate ───────────────────
-
-RESPONSE_TYPES = ['soporte','educativo','cross_sell','retencion','alerta_preventiva']
+# ── Target multicategoría ─────────────────────────────────
 
 FEATURES_RESPONSE_MODEL = FEATURES_MODELO + [
     'txn_cashback_total','txn_n_inter',
@@ -919,37 +920,37 @@ FEATURES_RESPONSE_MODEL = FEATURES_MODELO + [
     'conv_reintentos_48h',
     'target_riesgo_churn','target_propension_credito',
     'target_prefiere_voz','target_tono_formal',
-    'target_interaccion_ruido',    # ══ NUEVO v3 ══
+    'target_interaccion_ruido',    # NUEVO v3
 ]
 
 
 def construir_response_type_optimo(master):
     """
-    ══ ACTUALIZADO EN v3 ══
-    Agrega "educativo" forzado cuando target_interaccion_ruido=1.
     Prioridad: soporte > retencion > alerta > ruido > cross_sell > educativo
+    NUEVO v3: ruido explícito antes de cross_sell.
     """
     df = master.copy()
 
-    soporte   = ((df.get('conv_frustracion', 0) >= 1) |
-                 (df.get('intent_aclaracion', 0) > 0) |
-                 (df.get('intent_seguridad', 0) > 0) |
-                 (df.get('txn_pct_fallida', 0) > 0.12) |
-                 (df.get('conv_reintentos_48h', 0) >= 2))
-    retencion = ((df.get('dias_desde_ultimo_login', 0) > 30) &
-                 (df.get('satisfaccion_1_10', 10) < 7))
-    alerta    = ((df.get('txn_pct_atipico', 0) > 0.08) |
-                 (df.get('txn_n_intentos_ext', 0) >= 3) |
-                 ((df.get('txn_pct_inter', 0) > 0.05) & (df.get('txn_n_inter', 0) >= 2)))
-    # ══ NUEVO v3: ruido explícito antes de cross_sell ══
-    ruido     = (df.get('target_interaccion_ruido', 0) == 1)
-    cross_sell= (((df.get('intent_credito', 0) > 0) & (~df.get('prod_tiene_credito', False).astype(bool))) |
-                 ((df.get('intent_inversion', 0) > 0) & (~df.get('prod_tiene_inversion', False).astype(bool))) |
-                 ((df.get('intent_negocio', 0) > 0) & (~df.get('prod_tiene_negocio', False).astype(bool))) |
-                 ((df.get('txn_cashback_total', 0) > 0) & (~df.get('es_hey_pro', False).astype(bool))))
-    educativo = ((df.get('conv_low_intent', 0) > 0.35) |
-                 (df.get('conv_noise_score', 0) > 0.25) |
-                 ((df.get('score_buro', 850) < 620) & (~df.get('prod_tiene_credito', False).astype(bool))))
+    soporte    = ((df.get('conv_frustracion', 0) >= 1) |
+                  (df.get('intent_aclaracion', 0) > 0) |
+                  (df.get('intent_seguridad', 0) > 0) |
+                  (df.get('txn_pct_fallida', 0) > 0.12) |
+                  (df.get('conv_reintentos_48h', 0) >= 2))
+    retencion  = ((df.get('dias_desde_ultimo_login', 0) > 30) &
+                  (df.get('satisfaccion_1_10', 10) < 7))
+    alerta     = ((df.get('txn_pct_atipico', 0) > 0.08) |
+                  (df.get('txn_n_intentos_ext', 0) >= 3) |
+                  ((df.get('txn_pct_inter', 0) > 0.05) & (df.get('txn_n_inter', 0) >= 2)))
+    ruido      = (df.get('target_interaccion_ruido', 0) == 1)
+    cross_sell = (
+        ((df.get('intent_credito', 0) > 0) & (~df.get('prod_tiene_credito', False).astype(bool))) |
+        ((df.get('intent_inversion', 0) > 0) & (~df.get('prod_tiene_inversion', False).astype(bool))) |
+        ((df.get('intent_negocio', 0) > 0) & (~df.get('prod_tiene_negocio', False).astype(bool))) |
+        ((df.get('txn_cashback_total', 0) > 0) & (~df.get('es_hey_pro', False).astype(bool)))
+    )
+    educativo  = ((df.get('conv_low_intent', 0) > 0.35) |
+                  (df.get('conv_noise_score', 0) > 0.25) |
+                  ((df.get('score_buro', 850) < 620) & (~df.get('prod_tiene_credito', False).astype(bool))))
 
     df['response_type_optimo'] = np.select(
         [soporte, retencion, alerta, ruido, cross_sell, educativo],
@@ -958,18 +959,15 @@ def construir_response_type_optimo(master):
     )
     print("\n  Distribución response_type_optimo:")
     dist = df['response_type_optimo'].value_counts(normalize=True).mul(100).round(1)
-    for k, v in dist.items(): print(f"    {k:<25} {v}%")
+    for k, v in dist.items():
+        print(f"    {k:<25} {v}%")
     return df
 
 
 def entrenar_modelo_response_type(master):
     """
-    ══ NUEVO EN v3 ══
     GBM multiclase calibrado para predecir response_type_optimo.
-    Incluye:
-      • CV macro-F1
-      • Matriz de confusión guardada
-      • top-12 features
+    n_jobs=1 — evita MemoryError de joblib en Windows.
     """
     print("\n" + "═"*60)
     print("  MODELO CENTRAL: RESPONSE_TYPE (multiclase)")
@@ -978,29 +976,27 @@ def entrenar_modelo_response_type(master):
     df   = master.copy()
     cols = [c for c in FEATURES_RESPONSE_MODEL if c in df.columns]
     X    = df[cols].copy()
+    X    = _preparar_X(X)
+    cols = X.columns.tolist()   # sincronizar tras deduplicar/limpiar
     y    = df['response_type_optimo']
-    for c in X.columns:
-        if X[c].dtype == bool: X[c] = X[c].astype(int)
 
-    # CV macro-F1
+    # CV macro-F1 — n_jobs=1 para Windows
     kfold  = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    base_m = GradientBoostingClassifier(n_estimators=160, max_depth=3,
-                                        learning_rate=0.05, subsample=0.8,
-                                        random_state=42)
-    cv_f1  = cross_val_score(base_m, X, y, cv=kfold,
-                             scoring='f1_macro', n_jobs=-1)
+    base_m = GradientBoostingClassifier(
+        n_estimators=160, max_depth=3,
+        learning_rate=0.05, subsample=0.8, random_state=42
+    )
+    cv_f1 = cross_val_score(base_m, X, y, cv=kfold, scoring='f1_macro', n_jobs=1)
     print(f"  CV Macro-F1: {cv_f1.mean():.4f} ± {cv_f1.std():.4f}")
 
-    # Train / test split
-    strat  = y if y.value_counts().min() >= 2 else None
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2,
-                                               random_state=42, stratify=strat)
+    strat = y if y.value_counts().min() >= 2 else None
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=strat
+    )
 
-    # Modelo calibrado
     cal_m = CalibratedClassifierCV(base_m, method='isotonic', cv=5)
     cal_m.fit(X_tr, y_tr)
     y_pred = cal_m.predict(X_te)
-    y_prob = cal_m.predict_proba(X_te)
 
     acc    = accuracy_score(y_te, y_pred)
     f1_mac = f1_score(y_te, y_pred, average='macro', zero_division=0)
@@ -1008,10 +1004,8 @@ def entrenar_modelo_response_type(master):
     print("\n  Classification report:")
     print(classification_report(y_te, y_pred, zero_division=0))
 
-    # Feature importance media sobre los calibradores internos
-    fi_list = []
-    for cc in cal_m.calibrated_classifiers_:
-        fi_list.append(cc.estimator.feature_importances_)
+    fi_list = [cc.estimator.feature_importances_
+               for cc in cal_m.calibrated_classifiers_]
     fi_mean = np.mean(fi_list, axis=0)
     top12   = pd.Series(fi_mean, index=cols).nlargest(12)
     print("  Top-12 features:")
@@ -1019,31 +1013,29 @@ def entrenar_modelo_response_type(master):
         mark = " ★" if 'noise' in feat else ""
         print(f"    {feat:<45} {imp:.4f}{mark}")
 
-    # Matriz de confusión
     _plot_confusion_matrix(y_te, y_pred, cal_m.classes_)
-
     return cal_m, cols
 
 
 def _plot_confusion_matrix(y_te, y_pred, classes):
     fig, ax = plt.subplots(figsize=(7, 5), facecolor='white')
-    cm = confusion_matrix(y_te, y_pred, labels=classes)
+    cm   = confusion_matrix(y_te, y_pred, labels=classes)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=classes)
     disp.plot(ax=ax, colorbar=False, cmap='Blues', values_format='d')
-    ax.set_title('Matriz de confusión — response_type_optimo', fontsize=11, fontweight='bold')
+    ax.set_title('Matriz de confusión — response_type_optimo',
+                 fontsize=11, fontweight='bold')
     plt.xticks(rotation=30, ha='right', fontsize=8)
     plt.yticks(fontsize=8)
     plt.tight_layout()
-    p = _out('plot_confusion_matrix_response.png')
-    plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
-    print(f"\n  → Confusion matrix: {p}")
+    plt.savefig(_out('plot_confusion_matrix_response.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n  → Confusion matrix guardada")
 
 
 def predecir_response_type(master, modelo_response, cols_response):
     df = master.copy()
     X  = df[[c for c in cols_response if c in df.columns]].copy()
-    for c in X.columns:
-        if X[c].dtype == bool: X[c] = X[c].astype(int)
+    X  = _preparar_X(X)
     probs   = modelo_response.predict_proba(X)
     classes = modelo_response.classes_
     df['response_type_pred']  = classes[np.argmax(probs, axis=1)]
@@ -1054,26 +1046,14 @@ def predecir_response_type(master, modelo_response, cols_response):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECCIÓN 5C — NOISE GATE PARA INFERENCIA EN TIEMPO REAL
+# SECCIÓN 5C — NOISE GATE (inferencia en tiempo real)
 # ═══════════════════════════════════════════════════════════
-
-# ══ NUEVO EN v3 ══════════════════════════════════════════════
 #
-# El noise gate opera en dos capas:
+# CAPA 1 — nivel usuario (batch semanal):
+#   conv_noise_pct > 0.40 → modo educativo, sin cross-sell
 #
-#   CAPA 1 — nivel de usuario (batch, se actualiza semanalmente):
-#     Si conv_noise_pct > UMBRAL_USUARIO → usuario "explorador"
-#     → response_type forzado a "educativo" independientemente del modelo
-#
-#   CAPA 2 — nivel de mensaje (tiempo real, cada turno):
-#     Antes de generar la respuesta, Havi calcula noise_score del mensaje actual.
-#     Si noise_score > UMBRAL_MENSAJE → responder de forma neutra/lúdica
-#     → No presentar productos, no abrir oportunidades de cross-sell
-#
-# Umbrales diseñados conservadoramente para minimizar falsos positivos:
-#   UMBRAL_USUARIO  = 0.40  (>40% de sus mensajes históricos son ruido)
-#   UMBRAL_MENSAJE  = 0.50  (mensaje actual claramente no financiero)
-# ─────────────────────────────────────────────────────────────
+# CAPA 2 — nivel mensaje (tiempo real):
+#   noise_score_msg > 0.50 → respuesta neutra/lúdica, sin producto
 
 NOISE_GATE_UMBRAL_USUARIO  = 0.40
 NOISE_GATE_UMBRAL_MENSAJE  = 0.50
@@ -1081,21 +1061,14 @@ NOISE_GATE_UMBRAL_MENSAJE  = 0.50
 
 def noise_gate_turno_actual(texto_actual):
     """
-    Evalúa si el mensaje actual del usuario es ruido.
-    Se llama en tiempo real antes de que Havi genere la respuesta.
+    Evalúa si el mensaje actual es ruido.
+    Llamar antes de que Havi genere la respuesta.
 
     Returns:
-        gate_activado (bool): True → no hacer cross-sell en esta respuesta
-        noise_type    (str):  tipo de ruido detectado
-        noise_score   (float): puntuación [0, 1]
-        respuesta_sugerida (str | None): si es broma, respuesta lúdica sugerida
-
-    Ejemplo de uso en la API de Havi:
-        gate, tipo, score, resp = noise_gate_turno_actual(mensaje_usuario)
-        if gate:
-            return resp or respuesta_estandar_neutra()
-        else:
-            return pipeline_normal_havi(mensaje_usuario)
+        gate_activado      bool  — True → no hacer cross-sell
+        noise_type         str   — categoría del ruido
+        noise_score        float — puntuación [0, 1]
+        respuesta_sugerida str|None — respuesta lúdica si aplica
     """
     features = calcular_noise_features(texto_actual)
     ns       = features['noise_score_msg']
@@ -1103,17 +1076,16 @@ def noise_gate_turno_actual(texto_actual):
 
     gate_activado = bool(ns >= NOISE_GATE_UMBRAL_MENSAJE)
 
-    # Respuestas sugeridas por tipo de ruido
-    respuestas_lúdicas = {
-        'broma_offtopic':    "¡Jaja! Soy Havi, tu asistente Hey Banco 😄 ¿En qué te puedo ayudar con tu cuenta hoy?",
-        'solo_simbolos':     "¿Me puedes escribir en texto lo que necesitas? ¡Estoy aquí para ayudarte!",
-        'menu_navegacion':   None,   # Havi maneja internamente la navegación
-        'afirmacion_negacion': None, # Respuesta mid-conversación válida
-        'exploracion_corta': "¿Hay algo en lo que te pueda ayudar? Puedo orientarte con tu cuenta, tarjetas, crédito o inversiones.",
-        'artefacto_voz':     None,   # Procesar normalmente
-        'on_topic':          None,
+    respuestas_ludicas = {
+        'broma_offtopic':      "¡Jaja! Soy Havi, tu asistente Hey Banco 😄 ¿En qué te puedo ayudar con tu cuenta hoy?",
+        'solo_simbolos':       "¿Me puedes escribir en texto lo que necesitas? ¡Estoy aquí para ayudarte!",
+        'exploracion_corta':   "¿Hay algo en lo que te pueda ayudar? Puedo orientarte con tu cuenta, tarjetas, crédito o inversiones.",
+        'menu_navegacion':     None,
+        'afirmacion_negacion': None,
+        'artefacto_voz':       None,
+        'on_topic':            None,
     }
-    resp = respuestas_lúdicas.get(nt, None) if gate_activado else None
+    resp = respuestas_ludicas.get(nt, None) if gate_activado else None
 
     return gate_activado, nt, round(ns, 3), resp
 
@@ -1124,34 +1096,44 @@ def noise_gate_turno_actual(texto_actual):
 
 HAVI_PROFILES = {
     "PYME Emprendedor": {
-        "tono": "Formal, propositivo", "canal_pref": "Chat texto + correo resumen",
-        "horario": "09:00–11:00 y 15:00–17:00", "msg_style": "Propuesta con datos, sin emoji",
-        "productos": ["tarjeta_credito_negocios", "cuenta_negocios", "credito_personal"],
-        "trigger": "Transferencias +30% vs mes anterior",
+        "tono":      "Formal, propositivo",
+        "canal_pref":"Chat texto + correo resumen",
+        "horario":   "09:00–11:00 y 15:00–17:00",
+        "msg_style": "Propuesta con datos, sin emoji",
+        "productos": ["tarjeta_credito_negocios","cuenta_negocios","credito_personal"],
+        "trigger":   "Transferencias +30% vs mes anterior",
     },
     "Digital Básico": {
-        "tono": "Informal, directo", "canal_pref": "Push notification + chat texto",
-        "horario": "20:00–01:00", "msg_style": "Corto, accionable en 1 tap",
-        "productos": ["tarjeta_credito_hey", "credito_personal", "inversion_hey"],
-        "trigger": "Utilización > 70% o 3 días sin abrir app",
+        "tono":      "Informal, directo",
+        "canal_pref":"Push notification + chat texto",
+        "horario":   "20:00–01:00",
+        "msg_style": "Corto, accionable en 1 tap",
+        "productos": ["tarjeta_credito_hey","credito_personal","inversion_hey"],
+        "trigger":   "Utilización > 70% o 3 días sin abrir app",
     },
     "Premium Digital": {
-        "tono": "Sofisticado, proactivo", "canal_pref": "Push app iOS + chat texto",
-        "horario": "07:00–09:00", "msg_style": "Anticipar necesidades sin que pregunten",
-        "productos": ["inversion_hey", "credito_auto", "seguro_compras"],
-        "trigger": "Transacción internacional o utilización > 50%",
+        "tono":      "Sofisticado, proactivo",
+        "canal_pref":"Push app iOS + chat texto",
+        "horario":   "07:00–09:00",
+        "msg_style": "Anticipar necesidades sin que pregunten",
+        "productos": ["inversion_hey","credito_auto","seguro_compras"],
+        "trigger":   "Transacción internacional o utilización > 50%",
     },
     "Familia Establecida": {
-        "tono": "Semi-formal, empático", "canal_pref": "Notificación de quincena + chat",
-        "horario": "08:00–10:00 y 18:00–20:00", "msg_style": "Beneficio concreto + CTA clara",
-        "productos": ["credito_nomina", "inversion_hey", "seguro_vida"],
-        "trigger": "Día de nómina o NPS < 7",
+        "tono":      "Semi-formal, empático",
+        "canal_pref":"Notificación de quincena + chat",
+        "horario":   "08:00–10:00 y 18:00–20:00",
+        "msg_style": "Beneficio concreto + CTA clara",
+        "productos": ["credito_nomina","inversion_hey","seguro_vida"],
+        "trigger":   "Día de nómina o NPS < 7",
     },
     "Ahorrador Cauteloso": {
-        "tono": "Simple, empático, sin tecnicismos", "canal_pref": "Chat texto",
-        "horario": "10:00–14:00", "msg_style": "Educativo, sin presión",
-        "productos": ["tarjeta_credito_garantizada", "inversion_hey"],
-        "trigger": "Depósito en OXXO o consulta saldo 3+ veces/semana",
+        "tono":      "Simple, empático, sin tecnicismos",
+        "canal_pref":"Chat texto",
+        "horario":   "10:00–14:00",
+        "msg_style": "Educativo, sin presión",
+        "productos": ["tarjeta_credito_garantizada","inversion_hey"],
+        "trigger":   "Depósito en OXXO o consulta saldo 3+ veces/semana",
     },
 }
 
@@ -1166,57 +1148,60 @@ MENSAJES_EJEMPLO = {
 
 def generar_perfil_havi(user_row):
     """
-    ══ ACTUALIZADO EN v3 ══
     Genera el perfil de comunicación para un usuario.
 
-    Orden de prioridad de overrides:
-      1. NOISE GATE (usuario explorador) → fuerza educativo, sin cross-sell
-      2. Frustración alta → soporte primero
-      3. Utilización alta → diferimiento, no más crédito
-      4. Riesgo de churn → retención empática
-      5. Respuesta predicha por modelo central
+    Prioridad de overrides:
+      1. NOISE GATE → fuerza educativo, sin cross-sell
+      2. Canal voz detectado
+      3. Frustración alta → soporte primero
+      4. Utilización alta → diferimiento, no más crédito
+      5. Riesgo de churn → retención empática
+      6. Tipo de respuesta del modelo central
     """
     seg = user_row.get('segmento_nombre', 'Digital Básico')
     p   = HAVI_PROFILES.get(seg, HAVI_PROFILES["Digital Básico"]).copy()
     overrides = []
 
-    # ── 1. NOISE GATE (capa usuario) ─────────────────────
+    # 1. NOISE GATE (capa usuario)
     noise_pct = user_row.get('conv_noise_pct', 0)
     if noise_pct >= NOISE_GATE_UMBRAL_USUARIO:
-        p['msg_style'] = ('Modo exploración: respuestas educativas y simples. '
-                          'NO presentar productos ni cross-sell.')
-        p['productos'] = []
-        overrides.append(f'noise_gate_usuario ({noise_pct:.0%} ruido)')
+        p['msg_style']     = ('Modo exploración: respuestas educativas y simples. '
+                              'NO presentar productos ni cross-sell.')
+        p['productos']     = []
         p['response_type'] = 'educativo'
-        p['overrides']     = overrides
-        p['mensaje_ejemplo'] = "¡Hola! Soy Havi. Puedo ayudarte con tu cuenta, tarjetas, transferencias o inversiones. ¿Qué necesitas?"
+        p['overrides']     = [f'noise_gate_usuario ({noise_pct:.0%} ruido)']
+        p['mensaje_ejemplo'] = ("¡Hola! Soy Havi. Puedo ayudarte con tu cuenta, "
+                                "tarjetas, transferencias o inversiones. ¿Qué necesitas?")
         return p
 
-    # ── 2. Canal voz ──────────────────────────────────────
+    # 2. Canal voz
     if user_row.get('conv_pct_voz', 0) > 0.30:
-        p['canal_pref'] = 'Voz (preferencia detectada)'; overrides.append('canal→voz')
+        p['canal_pref'] = 'Voz (preferencia detectada)'
+        overrides.append('canal→voz')
 
-    # ── 3. Frustración alta ───────────────────────────────
+    # 3. Frustración alta
     if user_row.get('conv_frustracion', 0) >= 2:
         p['msg_style'] = 'Resolver primero. Sin venta hasta confirmar solución.'
         overrides.append('frustración_alta')
 
-    # ── 4. Utilización alta → no más crédito ─────────────
+    # 4. Utilización alta
     if user_row.get('prod_util_max', 0) > 0.85:
         p['productos'] = ['diferimiento_MSI', 'inversion_hey']
         overrides.append('util_alta→no_credito')
 
-    # ── 5. Riesgo de churn ────────────────────────────────
+    # 5. Riesgo de churn
     if (user_row.get('dias_desde_ultimo_login', 0) > 30 and
             user_row.get('satisfaccion_1_10', 10) < 6):
         p['msg_style'] = 'Reactivación empática + beneficio inmediato'
         overrides.append('riesgo_churn')
 
-    # ── 6. Tipo de respuesta del modelo central ───────────
-    rt = user_row.get('response_type_pred', user_row.get('response_type_optimo', 'educativo'))
+    # 6. Tipo de respuesta del modelo central
+    rt = user_row.get('response_type_pred',
+                       user_row.get('response_type_optimo', 'educativo'))
     if rt == 'soporte':
         p['msg_style'] = 'Diagnóstico claro, pasos concretos. Sin venta.'
-        p['productos']  = []; overrides.append('response→soporte')
+        p['productos']  = []
+        overrides.append('response→soporte')
     elif rt == 'retencion':
         p['msg_style'] = 'Reactivación empática con beneficio inmediato'
         overrides.append('response→retencion')
@@ -1262,16 +1247,16 @@ def generar_tabla_perfiles(master):
         })
     df = pd.DataFrame(registros)
     ng = df['noise_gate_activo'].sum()
-    print(f"    → {len(df):,} perfiles generados | noise gate activo: {ng:,} ({ng/len(df):.1%})")
+    print(f"    → {len(df):,} perfiles | noise gate activo: {ng:,} ({ng/len(df):.1%})")
     return df
 
 
 def simular_impacto_negocio(master):
     print("\n" + "═"*60 + "\n  IMPACTO DE NEGOCIO\n" + "═"*60)
-    n       = len(master)
-    churners   = int((master.get('target_riesgo_churn', 0) == 1).sum())
-    cross      = int((master.get('response_type_pred','') == 'cross_sell').sum())
-    soporte_n  = int((master.get('response_type_pred','') == 'soporte').sum())
+    n            = len(master)
+    churners     = int((master.get('target_riesgo_churn', 0) == 1).sum())
+    cross        = int((master.get('response_type_pred','') == 'cross_sell').sum())
+    soporte_n    = int((master.get('response_type_pred','') == 'soporte').sum())
     exploradores = int((master.get('target_interaccion_ruido', 0) == 1).sum())
 
     kpis = {
@@ -1283,7 +1268,7 @@ def simular_impacto_negocio(master):
         'Casos de soporte':                    soporte_n,
         'Deflexión repetidos estimada (12%)':  int(soporte_n * 0.12),
         'Exploradores del bot (noise gate)':   exploradores,
-        'Mensajes promocionales filtrados':    exploradores,  # se convierten en educativo
+        'Mensajes promocionales filtrados':    exploradores,
     }
     print("\n  KPIs simulados para pitch:")
     for k, v in kpis.items():
@@ -1296,96 +1281,103 @@ def simular_impacto_negocio(master):
 # ═══════════════════════════════════════════════════════════
 
 def plot_noise_por_segmento(master):
-    """
-    ══ NUEVO EN v3 ══
-    Distribución de conv_noise_pct por segmento y
-    % de usuarios con noise gate activo.
-    """
     if 'segmento_nombre' not in master.columns: return
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), facecolor='white')
-    COLORES = {'PYME Emprendedor':'#7F77DD', 'Digital Básico':'#378ADD',
-               'Premium Digital':'#D85A30',  'Familia Establecida':'#1D9E75',
-               'Ahorrador Cauteloso':'#BA7517'}
-
-    # Boxplot noise_pct por segmento
-    ax1 = axes[0]
-    segs    = master['segmento_nombre'].unique()
-    data    = [master[master['segmento_nombre'] == s]['conv_noise_pct'].values for s in segs]
-    colors  = [COLORES.get(s, '#888') for s in segs]
-    bp = ax1.boxplot(data, patch_artist=True, labels=segs, medianprops={'color':'white','lw':2})
-    for patch, c in zip(bp['boxes'], colors): patch.set_facecolor(c); patch.set_alpha(0.7)
+    COLORES = {
+        'PYME Emprendedor':    '#7F77DD',
+        'Digital Básico':      '#378ADD',
+        'Premium Digital':     '#D85A30',
+        'Familia Establecida': '#1D9E75',
+        'Ahorrador Cauteloso': '#BA7517',
+    }
+    ax1   = axes[0]
+    segs  = master['segmento_nombre'].unique()
+    data  = [master[master['segmento_nombre'] == s]['conv_noise_pct'].values for s in segs]
+    colors = [COLORES.get(s, '#888') for s in segs]
+    bp = ax1.boxplot(data, patch_artist=True, labels=segs,
+                     medianprops={'color':'white','lw':2})
+    for patch, c in zip(bp['boxes'], colors):
+        patch.set_facecolor(c); patch.set_alpha(0.7)
     ax1.axhline(NOISE_GATE_UMBRAL_USUARIO, color='#E24B4A', ls='--', lw=1.2,
                 label=f'Umbral noise gate ({NOISE_GATE_UMBRAL_USUARIO:.0%})')
-    ax1.set_title('Distribución de ruido (conv_noise_pct) por segmento', fontsize=10, fontweight='bold')
-    ax1.set_ylabel('% mensajes ruidosos'); ax1.set_facecolor('#f8f8f8')
-    ax1.tick_params(axis='x', rotation=20, labelsize=8); ax1.legend(fontsize=8)
+    ax1.set_title('Ruido (conv_noise_pct) por segmento', fontsize=10, fontweight='bold')
+    ax1.set_ylabel('% mensajes ruidosos')
+    ax1.set_facecolor('#f8f8f8')
+    ax1.tick_params(axis='x', rotation=20, labelsize=8)
+    ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3, axis='y', linewidth=0.5)
 
-    # % noise gate activo por segmento
-    ax2 = axes[1]
+    ax2  = axes[1]
     gate = master.groupby('segmento_nombre').apply(
         lambda g: (g['conv_noise_pct'] >= NOISE_GATE_UMBRAL_USUARIO).mean() * 100
     ).sort_values()
-    bars = ax2.barh(gate.index, gate.values, color=[COLORES.get(s,'#888') for s in gate.index],
+    bars = ax2.barh(gate.index, gate.values,
+                    color=[COLORES.get(s,'#888') for s in gate.index],
                     height=0.55, alpha=0.85)
     for bar, v in zip(bars, gate.values):
         ax2.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2,
                  f'{v:.1f}%', va='center', fontsize=9)
-    ax2.set_title('% usuarios con noise gate activo por segmento', fontsize=10, fontweight='bold')
-    ax2.set_xlabel('% usuarios'); ax2.set_xlim(0, gate.max() * 1.3 + 1)
-    ax2.set_facecolor('#f8f8f8'); ax2.grid(True, alpha=0.3, axis='x', linewidth=0.5)
+    ax2.set_title('% usuarios con noise gate activo por segmento',
+                  fontsize=10, fontweight='bold')
+    ax2.set_xlabel('% usuarios')
+    ax2.set_xlim(0, gate.max() * 1.3 + 1)
+    ax2.set_facecolor('#f8f8f8')
+    ax2.grid(True, alpha=0.3, axis='x', linewidth=0.5)
     plt.tight_layout()
-    p = _out('plot_noise_por_segmento.png')
-    plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
-    print(f"  → Noise por segmento: {p}")
+    plt.savefig(_out('plot_noise_por_segmento.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  → Noise por segmento guardado")
 
 
 def plot_noise_types_breakdown(convs_raw):
-    """
-    ══ NUEVO EN v3 ══
-    Distribución de tipos de ruido en el corpus completo.
-    """
     convs = convs_raw.dropna(subset=['input']).copy()
     noise = convs['input'].apply(calcular_noise_features)
     convs = pd.concat([convs, noise], axis=1)
-
-    tipos   = convs['noise_type'].value_counts()
-    COLORES = {'on_topic':'#1D9E75', 'exploracion_corta':'#BA7517',
-               'afirmacion_negacion':'#378ADD', 'menu_navegacion':'#7F77DD',
-               'broma_offtopic':'#D85A30', 'solo_simbolos':'#E24B4A',
-               'artefacto_voz':'#888888'}
-
+    tipos = convs['noise_type'].value_counts()
+    COLORES = {
+        'on_topic':            '#1D9E75',
+        'exploracion_corta':   '#BA7517',
+        'afirmacion_negacion': '#378ADD',
+        'menu_navegacion':     '#7F77DD',
+        'broma_offtopic':      '#D85A30',
+        'solo_simbolos':       '#E24B4A',
+        'artefacto_voz':       '#888888',
+    }
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), facecolor='white')
-
-    # Bar chart
-    ax1 = axes[0]
-    bars = ax1.barh(tipos.index, tipos.values,
-                    color=[COLORES.get(t,'#888') for t in tipos.index],
-                    height=0.55, alpha=0.85)
+    ax1   = axes[0]
     total = len(convs)
+    bars  = ax1.barh(tipos.index, tipos.values,
+                     color=[COLORES.get(t,'#888') for t in tipos.index],
+                     height=0.55, alpha=0.85)
     for bar, v in zip(bars, tipos.values):
         ax1.text(bar.get_width() + 50, bar.get_y() + bar.get_height()/2,
                  f'{v:,} ({v/total:.1%})', va='center', fontsize=9)
     ax1.set_title('Tipos de ruido en conversaciones Havi', fontsize=10, fontweight='bold')
-    ax1.set_xlabel('Número de turnos'); ax1.set_xlim(0, tipos.max() * 1.4)
-    ax1.set_facecolor('#f8f8f8'); ax1.grid(True, alpha=0.3, axis='x', linewidth=0.5)
+    ax1.set_xlabel('Número de turnos')
+    ax1.set_xlim(0, tipos.max() * 1.4)
+    ax1.set_facecolor('#f8f8f8')
+    ax1.grid(True, alpha=0.3, axis='x', linewidth=0.5)
 
-    # Noise score distribution
-    ax2 = axes[1]
-    ruido_data = convs[convs['noise_type'] != 'on_topic']['noise_score_msg']
+    ax2          = axes[1]
+    ruido_data   = convs[convs['noise_type'] != 'on_topic']['noise_score_msg']
     ontopic_data = convs[convs['noise_type'] == 'on_topic']['noise_score_msg']
-    ax2.hist(ontopic_data, bins=20, color='#1D9E75', alpha=0.6, label='on_topic', density=True)
-    ax2.hist(ruido_data, bins=20, color='#D85A30', alpha=0.6, label='ruido', density=True)
+    ax2.hist(ontopic_data, bins=20, color='#1D9E75', alpha=0.6,
+             label='on_topic', density=True)
+    ax2.hist(ruido_data,   bins=20, color='#D85A30', alpha=0.6,
+             label='ruido',    density=True)
     ax2.axvline(NOISE_GATE_UMBRAL_MENSAJE, color='#E24B4A', ls='--', lw=1.5,
                 label=f'Umbral mensaje ({NOISE_GATE_UMBRAL_MENSAJE})')
-    ax2.set_title('Distribución noise_score por tipo de mensaje', fontsize=10, fontweight='bold')
-    ax2.set_xlabel('noise_score_msg'); ax2.set_ylabel('Densidad')
-    ax2.legend(fontsize=9); ax2.set_facecolor('#f8f8f8')
+    ax2.set_title('Distribución noise_score por tipo de mensaje',
+                  fontsize=10, fontweight='bold')
+    ax2.set_xlabel('noise_score_msg')
+    ax2.set_ylabel('Densidad')
+    ax2.legend(fontsize=9)
+    ax2.set_facecolor('#f8f8f8')
     ax2.grid(True, alpha=0.3, linewidth=0.5)
     plt.tight_layout()
-    p = _out('plot_noise_types.png')
-    plt.savefig(p, dpi=150, bbox_inches='tight'); plt.close()
-    print(f"  → Tipos de ruido: {p}")
+    plt.savefig(_out('plot_noise_types.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  → Tipos de ruido guardados")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1419,12 +1411,9 @@ if __name__ == '__main__':
     # 5. Targets + modelos
     master = construir_targets(master)
     master = construir_response_type_optimo(master)
-
     modelos_binarios = entrenar_modelos(master, plot=True)
-
     modelo_response, cols_response = entrenar_modelo_response_type(master)
     master = predecir_response_type(master, modelo_response, cols_response)
-
     impacto = simular_impacto_negocio(master)
 
     # 6. Motor Havi
@@ -1435,7 +1424,7 @@ if __name__ == '__main__':
     plot_noise_por_segmento(master)
     plot_noise_types_breakdown(convs)
 
-    # 8. Guardar
+    # 8. Guardar outputs
     print("\n" + "═"*60 + "\n  GUARDANDO OUTPUTS\n" + "═"*60)
     master.to_csv(_out('master_usuarios_v3.csv'), index=False)
     perfiles.to_csv(_out('perfiles_havi_v3.csv'), index=False)
@@ -1452,17 +1441,17 @@ if __name__ == '__main__':
         "B",
         "si",
         "Quiero hacer una transferencia a otro banco por SPEI",
-        "¿Me cuentas un chiste?",
+        "Cuéntame un chiste",
         "No me deja hacer la transferencia, me sale error de token",
     ]
     print(f"\n  {'Mensaje':<50} {'Gate':^6} {'Tipo':<22} {'Score':^6}")
     print("  " + "─"*90)
     for msg in mensajes_demo:
         gate, tipo, score, resp = noise_gate_turno_actual(msg)
-        flag = "🚫" if gate else "✅"
+        flag = "NO" if gate else "OK"
         print(f"  {msg[:49]:<50} {flag:^6} {tipo:<22} {score:^6.3f}")
         if resp:
-            print(f"    ↳ Havi responde: {resp[:80]}")
+            print(f"    Havi: {resp[:85]}")
 
     print("\n" + "═"*60)
     print("  PIPELINE v3 COMPLETADO")
