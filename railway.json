@@ -5,7 +5,7 @@
   },
   "deploy": {
     "startCommand": "uvicorn havi_api:app --host 0.0.0.0 --port $PORT",
-    "healthcheckPath": "/",
+    "healthcheckPath": "/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
