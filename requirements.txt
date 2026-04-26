@@ -7,3 +7,5 @@ seaborn
 fastapi
 uvicorn[standard]
 sse-starlette
+gunicorn
+python-multipart

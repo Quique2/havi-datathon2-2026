@@ -1,1 +1,1 @@
-web: uvicorn havi_api:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120
+web: gunicorn -k uvicorn.workers.UvicornWorker havi_api:app --bind 0.0.0.0:$PORT
