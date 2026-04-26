@@ -279,24 +279,31 @@ def cargar_perfil(user_id):
 def construir_system_prompt(perfil, contexto_rag=""):
     """
     Genera el system prompt personalizado para Claude.
-    Incluye el perfil del usuario y, opcionalmente, ejemplos del RAG.
+    Usa las 6 dimensiones del perfil derivadas del análisis de z-scores:
+    tono, longitud, emojis, urgencia, horario, estilo.
     """
-    user_id       = perfil.get('user_id', '')
-    segmento      = perfil.get('segmento_nombre', 'Digital Básico')
-    tono          = perfil.get('tono', 'informal')
-    estilo        = perfil.get('estilo_comunicacion', 'directo y claro')
-    horario       = perfil.get('horario', '')
-    prod_1        = perfil.get('producto_top_1', '')
-    prod_2        = perfil.get('producto_top_2', '')
-    prod_3        = perfil.get('producto_top_3', '')
+    user_id   = perfil.get('user_id', '')
+    segmento  = perfil.get('segmento_nombre', 'Usuario de Crédito Moderado')
+
+    # Dimensiones de comunicación del pipeline (derivadas del clustering real)
+    tono      = perfil.get('tono', 'amigable y concreto')
+    longitud  = perfil.get('longitud', 'media')
+    emojis    = perfil.get('emojis', 'ocasional')
+    urgencia  = perfil.get('urgencia', 'empática')
+    horario   = perfil.get('horario', '')
+    estilo    = perfil.get('estilo_comunicacion', 'claro y directo')
+
+    prod_1 = perfil.get('producto_top_1', '')
+    prod_2 = perfil.get('producto_top_2', '')
+    prod_3 = perfil.get('producto_top_3', '')
     productos_rec = [p for p in [prod_1, prod_2, prod_3] if p]
 
-    flag_churn      = bool(int(perfil.get('flag_riesgo_churn', 0)))
-    flag_estresado  = bool(int(perfil.get('flag_credito_estresado', 0)))
-    flag_atipico    = bool(int(perfil.get('flag_uso_atipico', 0)))
-    noise_usuario   = float(perfil.get('noise_score_usuario', 0))
-    es_explorador   = noise_usuario >= NOISE_GATE_UMBRAL_USUARIO
-    frustracion     = int(perfil.get('conv_frustracion', 0))
+    flag_churn     = bool(int(perfil.get('flag_riesgo_churn', 0)))
+    flag_estresado = bool(int(perfil.get('flag_credito_estresado', 0)))
+    flag_atipico   = bool(int(perfil.get('flag_uso_atipico', 0)))
+    noise_usuario  = float(perfil.get('noise_score_usuario', 0))
+    es_explorador  = noise_usuario >= NOISE_GATE_UMBRAL_USUARIO
+    frustracion    = int(perfil.get('conv_frustracion', 0))
 
     ingreso    = perfil.get('ingreso_mensual_mxn', 0)
     score_buro = perfil.get('score_buro', 0)
@@ -306,7 +313,28 @@ def construir_system_prompt(perfil, contexto_rag=""):
     nps        = perfil.get('satisfaccion_1_10', 0)
     dias_login = int(perfil.get('dias_desde_ultimo_login', 0))
 
-    prompt = f"""Eres Havi, el asistente virtual de Hey Banco. Eres profesional, empático y estás diseñado para ayudar al cliente de forma personalizada.
+    # Traducción de dimensiones a instrucciones concretas
+    _long_map = {
+        'corta':  'Máximo 2 oraciones por respuesta. Ve directo al punto.',
+        'media':  'Máximo 3-4 oraciones. Responde completo pero sin rodeos.',
+        'larga':  'Puedes desarrollar la respuesta con detalle si el tema lo requiere.',
+    }
+    _emoji_map = {
+        'nunca':     'NO uses emojis bajo ninguna circunstancia.',
+        'ocasional': 'Puedes usar un emoji al inicio o al final si da calidez, no más de uno por mensaje.',
+        'frecuente': 'Puedes usar emojis para hacer la respuesta más amigable.',
+    }
+    _urgencia_map = {
+        'inmediata': 'Si el cliente reporta un problema o disputa, ofrece solución en el mismo mensaje sin preguntas adicionales.',
+        'empática':  'Antes de resolver, valida brevemente cómo se siente el cliente.',
+        'formal':    'Mantén un tono profesional incluso ante quejas. Responde con datos y pasos concretos.',
+    }
+
+    instruccion_longitud = _long_map.get(longitud, _long_map['media'])
+    instruccion_emojis   = _emoji_map.get(emojis, _emoji_map['ocasional'])
+    instruccion_urgencia = _urgencia_map.get(urgencia, _urgencia_map['empática'])
+
+    prompt = f"""Eres Havi, el asistente virtual de Hey Banco. Tu misión es brindar atención personalizada, resolviendo dudas y guiando al cliente según su perfil específico.
 
 ## PERFIL DEL CLIENTE ({user_id})
 
@@ -317,55 +345,66 @@ def construir_system_prompt(perfil, contexto_rag=""):
 - **Satisfacción (NPS):** {nps}/10
 - **Último login:** hace {dias_login} días
 
-## ESTILO DE COMUNICACIÓN
+## CÓMO DEBES COMUNICARTE CON ESTE CLIENTE
+
+Este cliente pertenece al segmento **{segmento}**, lo que define exactamente cómo debes hablarle:
 
 - **Tono:** {tono}
-- **Estilo:** {estilo}
+- **Longitud de respuesta:** {instruccion_longitud}
+- **Emojis:** {instruccion_emojis}
+- **Ante urgencia o problemas:** {instruccion_urgencia}
 - **Horario de mayor actividad:** {horario}
+
+**Estilo específico del segmento:**
+{estilo}
 
 ## PRODUCTOS RECOMENDADOS
 
-Productos con mayor probabilidad de ser útiles para este cliente:
-{chr(10).join(f"  {i+1}. {p}" for i, p in enumerate(productos_rec)) if productos_rec else "  (sin recomendaciones activas)"}
+Basado en el perfil de comportamiento de este cliente, los productos con mayor probabilidad de ser útiles:
+{chr(10).join(f"  {i+1}. {p}" for i, p in enumerate(productos_rec)) if productos_rec else "  (sin recomendaciones activas en este momento)"}
 
-Menciona estos productos solo si son relevantes al contexto. No los ofrezcas en cada respuesta.
+Menciona estos productos solo si emergen naturalmente del contexto de la conversación. No los fuerces.
 """
 
-    # Instrucciones condicionales
+    # Instrucciones condicionales por flags de riesgo
     instrucciones = []
 
     if es_explorador:
         instrucciones.append(
-            "- Este cliente usa el chat de forma exploratoria. "
-            "NO ofrezcas productos. Responde de forma educativa y orientadora."
+            "⚠ NOISE GATE ACTIVO: Este cliente interactúa frecuentemente con "
+            "mensajes no financieros. NO ofrezcas productos en esta sesión. "
+            "Responde de forma educativa y orientadora únicamente."
         )
     if flag_estresado:
         instrucciones.append(
-            "- Utilización de crédito >85%. NO ofrezcas más crédito. "
-            "Orienta hacia diferimiento o plan de pagos si el tema surge."
+            "⚠ CRÉDITO ESTRESADO: Utilización >85%. PROHIBIDO ofrecer más crédito. "
+            "Si el tema surge, orienta hacia diferimiento de pagos o MSI."
         )
     if flag_churn:
         instrucciones.append(
-            "- Cliente con riesgo de abandono (inactivo + NPS bajo). "
-            "Prioriza resolver su problema. Tono empático."
+            "⚠ RIESGO DE ABANDONO: Cliente inactivo con NPS bajo. "
+            "Prioriza resolver su problema completamente antes de cualquier oferta. "
+            "El objetivo es que quede satisfecho con esta interacción."
         )
     if flag_atipico:
         instrucciones.append(
-            "- Patrones de uso atípicos detectados. "
-            "Si menciona movimientos desconocidos, ofrece iniciar aclaración."
+            "⚠ PATRÓN ATÍPICO: Se detectaron movimientos inusuales en su cuenta. "
+            "Si menciona cargos o movimientos desconocidos, ofrece iniciar una "
+            "aclaración de inmediato sin hacerle preguntas de más."
         )
     if frustracion >= 2:
         instrucciones.append(
-            "- Ha expresado frustración en conversaciones previas. "
-            "Resuelve primero, vende después."
-        )
-    if not instrucciones:
-        instrucciones.append(
-            "- Cliente activo y sin alertas. "
-            "Puedes mencionar los productos recomendados si el contexto lo permite."
+            "⚠ FRUSTRACIÓN HISTÓRICA: Este cliente expresó frustración en "
+            "conversaciones anteriores. Empieza siempre resolviendo, no vendiendo."
         )
 
-    prompt += "\n## INSTRUCCIONES ESPECÍFICAS\n" + "\n".join(instrucciones)
+    if instrucciones:
+        prompt += "\n## ALERTAS ACTIVAS — LEER ANTES DE RESPONDER\n"
+        prompt += "\n".join(instrucciones)
+    else:
+        prompt += ("\n## ESTADO DEL CLIENTE\n"
+                   "Sin alertas activas. Puedes responder con normalidad y mencionar "
+                   "los productos recomendados si el contexto lo permite.")
 
     # Contexto RAG
     if contexto_rag:
@@ -373,14 +412,14 @@ Menciona estos productos solo si son relevantes al contexto. No los ofrezcas en 
 
     prompt += """
 
-## REGLAS GENERALES
+## REGLAS INVARIABLES
 
-1. Responde siempre en español mexicano.
-2. Nunca inventes saldos, fechas, montos o datos que no conozcas.
-3. Si no sabes algo, dilo claramente y ofrece alternativas.
-4. Respuestas concisas — máximo 3 párrafos salvo que el cliente pida más.
-5. Si el cliente pide hablar con un humano: indica que puede llamar al 800-123-4567.
-6. Nunca compartas datos sensibles del cliente en la respuesta.
+1. Responde siempre en español mexicano natural.
+2. Nunca inventes saldos, fechas, montos ni datos que no conozcas.
+3. Si no sabes algo, dilo claramente y ofrece alternativas reales.
+4. Si el cliente pide hablar con un humano: indica 800-123-4567, disponible 24/7.
+5. Nunca solicites ni repitas datos sensibles (NIP, contraseñas, número de tarjeta completo).
+6. Aplica SIEMPRE las instrucciones de longitud y emojis del segmento — son parte de la personalización.
 """
     return prompt
 
@@ -425,7 +464,7 @@ def llamar_claude(system_prompt, historial, mensaje_usuario):
     messages = historial + [{"role": "user", "content": mensaje_usuario}]
 
     payload = json.dumps({
-        "model":      "claude-sonnet-4-20250514",
+        "model":      "claude-sonnet-4-5",
         "max_tokens": 1000,
         "system":     system_prompt,
         "messages":   messages,

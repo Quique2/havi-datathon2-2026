@@ -326,7 +326,8 @@ def construir_master(cl, pr, tx, cv):
     m = m.merge(f_cv, on='user_id', how='left')
     m = m.fillna(0)
 
-    # ── NUEVO: codificar columnas categóricas ──────────────
+    # ── Codificar columnas categóricas ──────────────────────
+    # GBM no acepta strings — convertir a códigos numéricos
     for col in ['nivel_educativo', 'ocupacion', 'genero',
                 'estado', 'ciudad', 'preferencia_canal',
                 'canal_apertura', 'idioma_preferido']:
@@ -352,16 +353,19 @@ FEATURES_CLUSTERING = [
     'intent_credito','intent_inversion','intent_negocio','intent_aclaracion',
 ]
 
+# Nombres derivados del análisis de z-scores por cluster (notebook clustering_v2)
+# Features más distintivos documentados junto a cada cluster.
 NOMBRES_SEGMENTO = {
-    0: 'PYME Emprendedor',
-    1: 'Digital Básico',
-    2: 'Premium Digital',
-    3: 'Familia Establecida',
-    4: 'Ahorrador Cauteloso',
+    0: 'Caótico / Explorador de alto riesgo',   # txn_pct_atipico +3.69, frec +2.22, noise alto
+    1: 'No bancarizado / Básico',                # sin crédito, pocos productos, util baja
+    2: 'Premium Inversionista Digital',           # inversión +1.44, monto +1.28, viajes +1.16
+    3: 'Empresario / PYME Estable',              # prod_tiene_negocio +3.05, ingreso alto
+    4: 'Sobreendeudado / Uso Intensivo',         # util_media +1.24, util_max +1.20
+    5: 'Usuario de Crédito Moderado',            # crédito moderado, sin viajes, nocturno bajo
 }
 
 
-def segmentar(master, n_clusters=5, random_state=42):
+def segmentar(master, n_clusters=6, random_state=42):
     print("\n" + "═"*60)
     print("  SEGMENTACIÓN")
     print("═"*60)
@@ -465,12 +469,11 @@ def _preparar_X(df, cols):
             except Exception:
                 cols_a_eliminar.append(c)
 
-    # Eliminar fuera del loop para no modificar mientras iteramos
     if cols_a_eliminar:
         X = X.drop(columns=cols_a_eliminar)
 
+    cols = X.columns.tolist()  # sincronizar tras limpieza
     return X
-
 
 def entrenar_propension(master):
     """
@@ -560,38 +563,133 @@ def entrenar_propension(master):
 # SECCIÓN 5 — INFERENCIA: PERFIL COMPLETO POR USUARIO
 # ═══════════════════════════════════════════════════════════
 
-# Perfil de comunicación por segmento — SOLO preferencias,
-# el AGENTE decide qué decir con estos parámetros
+# Perfiles de comunicación derivados del análisis de z-scores (clustering_v2.ipynb)
+# Cada perfil define cómo Havi debe hablar CON ese segmento, no solo qué ofrecerle.
+#
+# Dimensiones definidas:
+#   tono        — registro lingüístico base
+#   longitud    — extensión de respuestas ('corta' ≤2 frases, 'media' ≤4, 'larga' >4)
+#   emojis      — uso de emojis ('nunca', 'ocasional', 'frecuente')
+#   urgencia    — cómo tratar temas urgentes ('inmediata', 'empática', 'formal')
+#   horario     — ventana de mayor engagement
+#   canal       — preferencia de canal
+#   estilo      — descripción libre para el system prompt
+#   productos_afinidad — productos con mayor fit según z-scores del cluster
+#   alertas     — qué monitorear proactivamente para este segmento
+
 PERFIL_COMUNICACION = {
-    'PYME Emprendedor': {
-        'tono':    'formal',
-        'canal':   'texto',
-        'horario': '09:00-11:00 y 15:00-17:00',
-        'estilo':  'propositivo, basado en datos, sin emojis',
+    # Cluster 0 — txn_pct_atipico +3.69, frec_por_dia +2.22, noise alto
+    'Caótico / Explorador de alto riesgo': {
+        'tono':               'empático y directo',
+        'longitud':           'corta',
+        'emojis':             'ocasional',
+        'urgencia':           'inmediata',
+        'horario':            'cualquier hora (patrón atípico)',
+        'canal':              'texto',
+        'estilo':             ('Respuestas muy cortas y claras. Este usuario tiene '
+                               'comportamiento transaccional inusual y alto ruido '
+                               'conversacional. Prioriza estabilizar su experiencia '
+                               'antes de ofrecer productos. Si hay disputa o problema, '
+                               'actúa de inmediato. No uses jerga financiera compleja.'),
+        'productos_afinidad': ['Seguro de Compras', 'Tarjeta de Crédito Hey'],
+        'alertas':            ['patron_uso_atipico', 'txn_pct_fallida > 0.15',
+                               'conv_noise_pct > 0.40'],
     },
-    'Digital Básico': {
-        'tono':    'informal',
-        'canal':   'texto',
-        'horario': '20:00-01:00',
-        'estilo':  'directo, corto, con emojis ocasionales',
+
+    # Cluster 1 — sin crédito, pocos productos, utilización baja
+    'No bancarizado / Básico': {
+        'tono':               'simple y educativo',
+        'longitud':           'media',
+        'emojis':             'ocasional',
+        'urgencia':           'empática',
+        'horario':            '10:00-14:00',
+        'canal':              'texto',
+        'estilo':             ('Usa lenguaje muy sencillo, sin tecnicismos. '
+                               'Este usuario tiene poca relación con productos '
+                               'financieros. Explica cada concepto desde cero sin '
+                               'asumir conocimiento previo. Transmite confianza. '
+                               'El objetivo es que entienda y se sienta acompañado, '
+                               'no que compre algo. Oraciones cortas.'),
+        'productos_afinidad': ['Tarjeta Garantizada', 'Inversión Hey'],
+        'alertas':            ['dias_desde_ultimo_login > 30', 'score_buro < 550'],
     },
-    'Premium Digital': {
-        'tono':    'sofisticado',
-        'canal':   'texto',
-        'horario': '07:00-09:00',
-        'estilo':  'proactivo, anticipar necesidades',
+
+    # Cluster 2 — inversión +1.44, monto_prom alto, viajes, digital
+    'Premium Inversionista Digital': {
+        'tono':               'sofisticado y proactivo',
+        'longitud':           'media',
+        'emojis':             'nunca',
+        'urgencia':           'formal',
+        'horario':            '07:00-09:00',
+        'canal':              'texto',
+        'estilo':             ('Tono refinado, sin exclamaciones ni emojis. '
+                               'Este usuario valora la información precisa y el '
+                               'beneficio cuantificado. Menciona GAT, rendimientos '
+                               'y comparativas cuando sea relevante. Anticipa '
+                               'necesidades basándote en su comportamiento de viajes '
+                               'y alto ticket promedio. Máximo 3 párrafos.'),
+        'productos_afinidad': ['Inversión Hey', 'Crédito Auto', 'Seguro de Compras'],
+        'alertas':            ['txn_pct_inter > 0.10', 'prod_util_max > 0.60'],
     },
-    'Familia Establecida': {
-        'tono':    'semi-formal',
-        'canal':   'texto',
-        'horario': '08:00-10:00 y 18:00-20:00',
-        'estilo':  'empático, con beneficio concreto',
+
+    # Cluster 3 — prod_tiene_negocio +3.05, ingreso alto, MSI alto
+    'Empresario / PYME Estable': {
+        'tono':               'formal y propositivo',
+        'longitud':           'media',
+        'emojis':             'nunca',
+        'urgencia':           'formal',
+        'horario':            '09:00-11:00 y 15:00-17:00',
+        'canal':              'texto',
+        'estilo':             ('Respuestas profesionales sin informalidad. '
+                               'Este usuario gestiona un negocio y toma decisiones '
+                               'financieras con datos. Presenta propuestas con cifras '
+                               'concretas. Usa términos como "límite de crédito", '
+                               '"flujo de caja", "cuenta de nómina empresarial". '
+                               'Evita diminutivos y lenguaje coloquial. '
+                               'Si hay una oferta, preséntala como propuesta de valor, '
+                               'no como promoción.'),
+        'productos_afinidad': ['Cuenta Negocios', 'Tarjeta de Crédito Negocios',
+                               'Crédito Personal'],
+        'alertas':            ['txn_volatilidad > 2.0', 'dias_desde_ultimo_login > 14'],
     },
-    'Ahorrador Cauteloso': {
-        'tono':    'simple',
-        'canal':   'texto',
-        'horario': '10:00-14:00',
-        'estilo':  'educativo, sin tecnicismos, sin presión',
+
+    # Cluster 4 — util_media +1.24, util_max +1.20, servicios digitales
+    'Sobreendeudado / Uso Intensivo': {
+        'tono':               'empático y sin presión',
+        'longitud':           'corta',
+        'emojis':             'ocasional',
+        'urgencia':           'empática',
+        'horario':            '18:00-22:00',
+        'canal':              'texto',
+        'estilo':             ('NUNCA ofrezcas más crédito a este usuario. '
+                               'Su utilización de crédito es muy alta. '
+                               'Enfócate en ayudarle a gestionar lo que ya tiene: '
+                               'diferimiento, MSI, plan de pagos. '
+                               'Tono empático y sin juicio. Respuestas cortas. '
+                               'Si menciona dificultad para pagar, ofrece opciones '
+                               'concretas de inmediato. No uses lenguaje de ventas.'),
+        'productos_afinidad': ['Inversión Hey'],   # único producto sin riesgo
+        'alertas':            ['prod_util_max > 0.85', 'txn_pct_fallida > 0.10',
+                               'conv_frustracion >= 1'],
+    },
+
+    # Cluster 5 — crédito moderado, nocturno bajo, sin viajes
+    'Usuario de Crédito Moderado': {
+        'tono':               'amigable y concreto',
+        'longitud':           'media',
+        'emojis':             'ocasional',
+        'urgencia':           'empática',
+        'horario':            '12:00-20:00',
+        'canal':              'texto',
+        'estilo':             ('Tono conversacional pero enfocado. '
+                               'Este usuario ya tiene crédito y lo usa con moderación. '
+                               'Puede estar listo para un siguiente producto si el '
+                               'contexto lo sugiere. Responde primero la pregunta '
+                               'y luego, si es natural, menciona una oportunidad. '
+                               'Usa frases cortas. Puedes usar un emoji ocasional '
+                               'para dar calidez, pero no exageres.'),
+        'productos_afinidad': ['Inversión Hey', 'Seguro de Vida', 'Hey Pro'],
+        'alertas':            ['dias_desde_ultimo_login > 21', 'satisfaccion_1_10 < 7'],
     },
 }
 
@@ -611,15 +709,16 @@ def inferir_perfiles(master, modelos_propension):
 
     perfiles = master[['user_id','segmento_id','segmento_nombre']].copy()
 
-    # Preferencias de comunicación
-    perfiles['tono']    = perfiles['segmento_nombre'].map(
-        lambda s: PERFIL_COMUNICACION.get(s, {}).get('tono', 'informal'))
-    perfiles['canal']   = perfiles['segmento_nombre'].map(
-        lambda s: PERFIL_COMUNICACION.get(s, {}).get('canal', 'texto'))
-    perfiles['horario'] = perfiles['segmento_nombre'].map(
-        lambda s: PERFIL_COMUNICACION.get(s, {}).get('horario', ''))
-    perfiles['estilo_comunicacion'] = perfiles['segmento_nombre'].map(
-        lambda s: PERFIL_COMUNICACION.get(s, {}).get('estilo', ''))
+    # Preferencias de comunicación — todas las dimensiones del perfil
+    for dim in ['tono', 'canal', 'horario', 'estilo_comunicacion',
+                'longitud', 'emojis', 'urgencia']:
+        key = 'estilo' if dim == 'estilo_comunicacion' else dim
+        perfiles[dim] = perfiles['segmento_nombre'].map(
+            lambda s, k=key: PERFIL_COMUNICACION.get(s, {}).get(k, ''))
+
+    # Alertas del segmento (lista → string separado por |)
+    perfiles['alertas_segmento'] = perfiles['segmento_nombre'].map(
+        lambda s: ' | '.join(PERFIL_COMUNICACION.get(s, {}).get('alertas', [])))
 
     # Ajuste de canal por voz
     if 'conv_pct_voz' in master.columns:
