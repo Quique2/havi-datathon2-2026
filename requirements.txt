@@ -1,0 +1,9 @@
+sentence-transformers
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+fastapi
+uvicorn[standard]
+sse-starlette
