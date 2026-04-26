@@ -9,3 +9,4 @@ uvicorn[standard]
 sse-starlette
 gunicorn
 python-multipart
+supabase

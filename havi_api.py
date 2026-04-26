@@ -21,8 +21,10 @@ Variables de entorno:
 
 import os, json, math, re, logging, asyncio, urllib.request, urllib.error
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
+from supabase import create_client, Client
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -52,7 +54,7 @@ def _data(fn): return os.path.join(BASE_DIR, fn)
 # ─────────────────────────────────────────────
 # ESTADO GLOBAL
 # ─────────────────────────────────────────────
-_perfiles:    Optional[pd.DataFrame] = None
+_supabase:    Optional[Client]        = None
 _rag_corpus:  Optional[list]         = None
 _rag_tfidf:   Optional[TfidfVectorizer] = None
 _rag_matrix                           = None
@@ -65,7 +67,7 @@ _sessions:    dict                    = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _perfiles, _rag_corpus, _rag_tfidf, _rag_matrix
+    global _supabase, _rag_corpus, _rag_tfidf, _rag_matrix
 
     log.info("=" * 55)
     log.info("  HAVI API — Iniciando (sin PyTorch)")
@@ -75,13 +77,17 @@ async def lifespan(app: FastAPI):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         log.warning("⚠ ANTHROPIC_API_KEY no configurada — las respuestas de Claude fallarán")
 
-    # 2. Perfiles
-    p = _out("perfiles_usuarios.csv")
-    if not os.path.exists(p):
-        raise RuntimeError(f"No se encontró {p}. Súbelo al repo.")
-    _perfiles = pd.read_csv(p)
-    log.info(f"  Perfiles: {len(_perfiles):,} usuarios | "
-             f"{_perfiles['segmento_nombre'].nunique()} segmentos")
+    # 2. Supabase
+    _supabase = create_client(
+        os.environ["SUPABASE_URL"],
+        os.environ["SUPABASE_SERVICE_KEY"],
+    )
+    count_res  = _supabase.table("usuarios").select("id", count="exact").execute()
+    n_usuarios = count_res.count or 0
+    seg_res    = (_supabase.table("clasificaciones")
+                  .select("segmento_nombre").eq("activo", True).execute())
+    n_segs     = len({r["segmento_nombre"] for r in seg_res.data})
+    log.info(f"  Supabase: {n_usuarios:,} usuarios | {n_segs} segmentos")
 
     # 3. RAG con TF-IDF
     convs_path = _data("dataset_50k_anonymized.csv")
@@ -350,11 +356,37 @@ def _llamar_claude(system_prompt: str, historial: list, mensaje: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 class HaviSession:
-    def __init__(self, user_id: str, perfil_row: pd.Series):
+    def __init__(self, user_id: str, perfil: dict):
         self.user_id   = user_id
-        self.perfil    = perfil_row.to_dict()
-        self.historial = []
-        self.turno     = 0
+        self.perfil    = perfil
+        self.sesion_id = self._init_sesion()
+        self.historial = self._cargar_historial()
+        self.turno     = len(self.historial) // 2
+
+    def _init_sesion(self) -> str:
+        existing = (_supabase.table("sesiones_chat")
+                    .select("id").eq("user_id", self.user_id).eq("activa", True)
+                    .limit(1).execute())
+        if existing.data:
+            return existing.data[0]["id"]
+        row = (_supabase.table("sesiones_chat")
+               .insert({"user_id": self.user_id, "activa": True}).execute())
+        return row.data[0]["id"]
+
+    def _cargar_historial(self) -> list:
+        msgs = (_supabase.table("mensajes")
+                .select("rol,contenido")
+                .eq("sesion_id", self.sesion_id)
+                .order("created_at").execute())
+        return [{"role": m["rol"], "content": m["contenido"]} for m in msgs.data]
+
+    def _guardar_mensajes(self, user_msg: str, asst_msg: str):
+        _supabase.table("mensajes").insert([
+            {"sesion_id": self.sesion_id, "user_id": self.user_id,
+             "rol": "user",      "tipo": "texto", "contenido": user_msg},
+            {"sesion_id": self.sesion_id, "user_id": self.user_id,
+             "rol": "assistant", "tipo": "texto", "contenido": asst_msg},
+        ]).execute()
 
     def chat(self, mensaje: str) -> tuple[str, dict]:
         self.turno += 1
@@ -362,6 +394,7 @@ class HaviSession:
         # Noise gate
         gate, tipo, score, resp_pred = _evaluar_noise(mensaje)
         if gate and resp_pred:
+            self._guardar_mensajes(mensaje, resp_pred)
             self.historial.append({"role": "user",      "content": mensaje})
             self.historial.append({"role": "assistant", "content": resp_pred})
             return resp_pred, {
@@ -377,6 +410,7 @@ class HaviSession:
         system_prompt = _construir_system_prompt(self.perfil, rag_docs)
         respuesta     = _llamar_claude(system_prompt, self.historial, mensaje)
 
+        self._guardar_mensajes(mensaje, respuesta)
         self.historial.append({"role": "user",      "content": mensaje})
         self.historial.append({"role": "assistant", "content": respuesta})
 
@@ -394,26 +428,39 @@ class HaviSession:
 # HELPERS
 # ═══════════════════════════════════════════════════════════
 
-def _get_perfil_row(user_id: str) -> pd.Series:
-    row = _perfiles[_perfiles["user_id"] == user_id]
-    if row.empty:
+def _get_perfil(user_id: str) -> dict:
+    u = _supabase.table("usuarios").select("*").eq("user_id", user_id).execute()
+    if not u.data:
         raise HTTPException(status_code=404,
                             detail=f"Usuario '{user_id}' no encontrado")
-    return row.iloc[0]
+    usuario = u.data[0]
+
+    c = (_supabase.table("clasificaciones")
+         .select("*").eq("user_id", user_id).eq("activo", True)
+         .order("created_at", desc=True).limit(1).execute())
+
+    demo = usuario.get("datos_demograficos") or {}
+    perfil: dict = {"user_id": user_id}
+    perfil.update(demo)
+    if c.data:
+        perfil.update(c.data[0])
+    return perfil
 
 def _get_or_create_session(user_id: str, reset: bool = False) -> HaviSession:
-    if reset and user_id in _sessions:
-        del _sessions[user_id]
+    if reset:
+        if user_id in _sessions:
+            del _sessions[user_id]
+        _supabase.table("sesiones_chat").update(
+            {"activa": False, "cerrada_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("user_id", user_id).eq("activa", True).execute()
     if user_id not in _sessions:
-        row = _get_perfil_row(user_id)
-        _sessions[user_id] = HaviSession(user_id, row)
+        perfil = _get_perfil(user_id)
+        _sessions[user_id] = HaviSession(user_id, perfil)
     return _sessions[user_id]
 
-def _clean_perfil(row: pd.Series) -> dict:
+def _clean_perfil(perfil: dict) -> dict:
     clean = {}
-    for k, v in row.to_dict().items():
-        if hasattr(v, "item"):
-            v = v.item()
+    for k, v in perfil.items():
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             v = None
         clean[k] = v
@@ -462,10 +509,20 @@ class ChatResponse(BaseModel):
 def health():
     """Health check — Railway lo usa para saber si el servidor arrancó."""
     key_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    n_usuarios, n_segs = 0, 0
+    if _supabase:
+        try:
+            cr = _supabase.table("usuarios").select("id", count="exact").execute()
+            n_usuarios = cr.count or 0
+            sr = (_supabase.table("clasificaciones")
+                  .select("segmento_nombre").eq("activo", True).execute())
+            n_segs = len({r["segmento_nombre"] for r in sr.data})
+        except Exception:
+            pass
     return {
         "status":          "ok",
-        "usuarios":        len(_perfiles) if _perfiles is not None else 0,
-        "segmentos":       int(_perfiles["segmento_nombre"].nunique()) if _perfiles is not None else 0,
+        "usuarios":        n_usuarios,
+        "segmentos":       n_segs,
         "rag_docs":        len(_rag_corpus) if _rag_corpus else 0,
         "rag_tipo":        "TF-IDF (sin PyTorch)",
         "api_key":         "present" if key_ok else "missing",
@@ -484,31 +541,36 @@ def list_users():
         "Sobreendeudado / Uso Intensivo",
         "Usuario de Crédito Moderado",
     ]
-    df     = _perfiles.fillna("").sort_values("user_id")
-    sample = df.groupby("segmento_nombre", sort=False).head(2).copy()
-    rank   = {s: i for i, s in enumerate(SEGMENT_ORDER)}
-    sample["_r"] = sample["segmento_nombre"].map(lambda s: rank.get(s, 99))
-    sample = sample.sort_values(["_r", "user_id"])
+    rows = (_supabase.table("clasificaciones")
+            .select("user_id,segmento_nombre,tono,producto_top_1")
+            .eq("activo", True).execute()).data
 
+    rank = {s: i for i, s in enumerate(SEGMENT_ORDER)}
+    rows.sort(key=lambda r: (rank.get(r.get("segmento_nombre", ""), 99),
+                              r.get("user_id", "")))
+
+    seen: dict[str, int] = {}
     users = []
-    for _, row in sample.iterrows():
+    for r in rows:
+        seg = r.get("segmento_nombre", "")
+        if seen.get(seg, 0) >= 2:
+            continue
+        seen[seg] = seen.get(seg, 0) + 1
         users.append({
-            "user_id":       row["user_id"],
-            "segmento":      row.get("segmento_nombre", ""),
-            "tono":          row.get("tono", ""),
-            "producto_top_1":row.get("producto_top_1", ""),
+            "user_id":        r.get("user_id", ""),
+            "segmento":       seg,
+            "tono":           r.get("tono", ""),
+            "producto_top_1": r.get("producto_top_1", ""),
         })
-    return {"users": users, "total": len(_perfiles)}
+
+    total = (_supabase.table("usuarios").select("id", count="exact").execute()).count or 0
+    return {"users": users, "total": total}
 
 
 @app.get("/profile/{user_id}")
 def get_profile(user_id: str):
     """Perfil completo del usuario."""
-    row = _perfiles[_perfiles["user_id"] == user_id]
-    if row.empty:
-        raise HTTPException(status_code=404,
-                            detail=f"Usuario '{user_id}' no encontrado")
-    return {"profile": _clean_perfil(row.iloc[0])}
+    return {"profile": _clean_perfil(_get_perfil(user_id))}
 
 
 @app.post("/chat/sync", response_model=ChatResponse)
@@ -577,32 +639,49 @@ def reset_session(user_id: str):
     """Reinicia la sesión de un usuario."""
     if user_id in _sessions:
         del _sessions[user_id]
+    _supabase.table("sesiones_chat").update(
+        {"activa": False, "cerrada_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("user_id", user_id).eq("activa", True).execute()
     return {"status": "ok", "user_id": user_id}
 
 
 @app.get("/clusters")
 def get_clusters():
     """Resumen de los 6 segmentos."""
+    rows = (_supabase.table("clasificaciones")
+            .select("segmento_nombre,tono,horario,noise_score_usuario")
+            .eq("activo", True).execute()).data
+
+    groups: dict[str, list] = {}
+    for r in rows:
+        seg = r.get("segmento_nombre", "Sin segmento")
+        groups.setdefault(seg, []).append(r)
+
+    total = len(rows) or 1
     res = []
-    for seg, grp in _perfiles.groupby("segmento_nombre"):
+    for seg, grp in groups.items():
+        noise_vals = [r["noise_score_usuario"] for r in grp
+                      if r.get("noise_score_usuario") is not None]
         res.append({
             "segmento":        seg,
             "n_usuarios":      len(grp),
-            "pct":             round(len(grp) / len(_perfiles), 3),
-            "tono":            grp["tono"].iloc[0] if "tono" in grp.columns else "",
-            "horario":         grp["horario"].iloc[0] if "horario" in grp.columns else "",
-            "noise_pct_medio": round(float(grp["noise_score_usuario"].mean()), 3),
+            "pct":             round(len(grp) / total, 3),
+            "tono":            grp[0].get("tono", ""),
+            "horario":         grp[0].get("horario", ""),
+            "noise_pct_medio": round(sum(noise_vals) / len(noise_vals), 3) if noise_vals else 0.0,
         })
     return sorted(res, key=lambda x: x["n_usuarios"], reverse=True)
 
 
 @app.get("/metricas")
 def get_metricas():
-    """Métricas AUC de propensión por producto."""
-    p = _out("metricas_propension.csv")
-    if not os.path.exists(p):
+    """Métricas AUC de propensión por producto (último pipeline_run)."""
+    run = (_supabase.table("pipeline_runs")
+           .select("metricas").order("ejecutado_at", desc=True).limit(1).execute())
+    if not run.data or not run.data[0].get("metricas"):
         raise HTTPException(status_code=404, detail="Métricas no disponibles")
-    return pd.read_csv(p).to_dict(orient="records")
+    metricas = run.data[0]["metricas"]
+    return metricas if isinstance(metricas, list) else [metricas]
 
 
 # ─────────────────────────────────────────────
