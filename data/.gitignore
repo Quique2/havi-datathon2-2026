@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+hey_transacciones.csv
